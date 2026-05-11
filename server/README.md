@@ -22,7 +22,16 @@
 - `GET /health`
 - `POST /v1/query`
 
-`POST /v1/query` 目前不做真实音频识别，只回显元数据并返回一组适合 200x200 墨水屏显示的示例文本。
+`POST /v1/query` 当前支持两种输入：
+
+- `query_text`
+- `audio` 文件
+
+目前仍然是 mock 逻辑：
+
+- 如果传了 `query_text`，直接把它当作转写结果
+- 如果传了 `audio`，返回一个占位 transcript
+- 再生成适合 200x200 墨水屏显示的 `display_lines`
 
 ## 后续拆分
 

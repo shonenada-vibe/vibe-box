@@ -1,0 +1,67 @@
+menu "Vibe Box Config"
+
+config VIBE_BOX_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        Station mode SSID for the device.
+
+config VIBE_BOX_WIFI_PASSWORD
+    string "Wi-Fi password"
+    default ""
+    help
+        Station mode password for the device.
+
+config VIBE_BOX_SERVER_BASE_URL
+    string "Server base URL"
+    default "http://192.168.1.100:8000"
+    help
+        Base URL for the thin server, for example http://192.168.1.100:8000.
+
+config VIBE_BOX_DEVICE_ID
+    string "Device ID"
+    default "vibe-box-dev"
+    help
+        Logical device ID sent to the thin server.
+
+config VIBE_BOX_FIRMWARE_VERSION
+    string "Firmware version"
+    default "dev"
+    help
+        Firmware version string sent to the thin server.
+
+config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
+    int "Health poll interval (ms)"
+    range 1000 600000
+    default 10000
+    help
+        Interval used to call GET /health after Wi-Fi is connected.
+
+config VIBE_BOX_ENABLE_DEMO_QUERY
+    bool "Enable demo /v1/query requests"
+    default y
+    help
+        When enabled, the device sends a demo text query to /v1/query instead of only
+        checking /health. This is useful before audio input is implemented.
+
+config VIBE_BOX_DEMO_QUERY_TEXT
+    string "Demo query text"
+    default "你好，Vibe Box"
+    help
+        Text sent as query_text when demo query mode is enabled.
+
+config VIBE_BOX_QUERY_POLL_INTERVAL_MS
+    int "Demo query poll interval (ms)"
+    range 1000 600000
+    default 30000
+    help
+        Interval used to call POST /v1/query in demo mode.
+
+config VIBE_BOX_WIFI_MAXIMUM_RETRY
+    int "Wi-Fi maximum retry count"
+    range 1 20
+    default 8
+    help
+        Number of Wi-Fi reconnect attempts before the app marks the network as failed.
+
+endmenu
