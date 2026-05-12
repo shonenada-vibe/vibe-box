@@ -2,6 +2,7 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cJSON.h"
@@ -10,32 +11,166 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 
+#include "audio_input.h"
 #include "esp_err.h"
 #include "esp_event.h"
+#include "esp_check.h"
 #include "esp_http_client.h"
+#include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 
 static const char *TAG = "vibe_box";
-static EventGroupHandle_t wifi_event_group;
+
+#define URL_ENCODE_ERROR ((size_t)-1)
 
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define HEALTH_RESPONSE_BUFFER_SIZE 256
-#define QUERY_RESPONSE_BUFFER_SIZE  2048
-#define FORM_BODY_BUFFER_SIZE       1024
-#define URL_BUFFER_SIZE             320
-#define QUERY_DISPLAY_LINE_MAX      4
-#define QUERY_DISPLAY_COL_MAX       96
-#define QUERY_TEXT_MAX              256
-#define QUERY_REPLY_MAX             512
-#define QUERY_REQUEST_ID_MAX        64
+#define HEALTH_RESPONSE_BUFFER_SIZE     256
+#define QUERY_RESPONSE_BUFFER_SIZE      2048
+#define FORM_BODY_BUFFER_SIZE           1024
+#define URL_BUFFER_SIZE                 320
+#define QUERY_DISPLAY_LINE_MAX          4
+#define QUERY_DISPLAY_COL_MAX           96
+#define QUERY_TEXT_MAX                  256
+#define QUERY_REPLY_MAX                 512
+#define QUERY_REQUEST_ID_MAX            64
+#define MULTIPART_BOUNDARY              "----VibeBoxBoundary7MA4YWxkTrZu0gW"
+#define RUNTIME_WIFI_SSID_MAX           33
+#define RUNTIME_WIFI_PASSWORD_MAX       65
+#define RUNTIME_SERVER_BASE_URL_MAX     192
+#define RUNTIME_API_TOKEN_MAX           192
+#define RUNTIME_DEVICE_ID_MAX           64
+#define RUNTIME_FIRMWARE_VERSION_MAX    64
+#define RUNTIME_LANGUAGE_MAX            16
+#define PROVISIONING_FORM_BUFFER_SIZE   1024
+#define PROVISIONING_HTML_BUFFER_SIZE   3072
+#define PROVISIONING_STATUS_BUFFER_SIZE 1024
+#define WIFI_CONNECT_TIMEOUT_MS         30000
+#define NVS_NAMESPACE                   "vibe_box"
 
+#ifdef CONFIG_VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD
+#define VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD 1
+#else
+#define VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_API_TOKEN
+#define VIBE_BOX_DEFAULT_API_TOKEN CONFIG_VIBE_BOX_API_TOKEN
+#else
+#define VIBE_BOX_DEFAULT_API_TOKEN ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_LANGUAGE
+#define VIBE_BOX_DEFAULT_LANGUAGE CONFIG_VIBE_BOX_LANGUAGE
+#else
+#define VIBE_BOX_DEFAULT_LANGUAGE "zh"
+#endif
+
+#ifdef CONFIG_VIBE_BOX_RECORDING_DURATION_MS
+#define VIBE_BOX_DEFAULT_RECORDING_DURATION_MS CONFIG_VIBE_BOX_RECORDING_DURATION_MS
+#else
+#define VIBE_BOX_DEFAULT_RECORDING_DURATION_MS 3000U
+#endif
+
+#ifdef CONFIG_VIBE_BOX_ENABLE_I2S_CAPTURE
+#define VIBE_BOX_ENABLE_I2S_CAPTURE 1
+#else
+#define VIBE_BOX_ENABLE_I2S_CAPTURE 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_PORT
+#define VIBE_BOX_I2S_PORT CONFIG_VIBE_BOX_I2S_PORT
+#else
+#define VIBE_BOX_I2S_PORT 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2C_PORT
+#define VIBE_BOX_I2C_PORT CONFIG_VIBE_BOX_I2C_PORT
+#else
+#define VIBE_BOX_I2C_PORT 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2C_SDA_GPIO
+#define VIBE_BOX_I2C_SDA_GPIO CONFIG_VIBE_BOX_I2C_SDA_GPIO
+#else
+#define VIBE_BOX_I2C_SDA_GPIO 47
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2C_SCL_GPIO
+#define VIBE_BOX_I2C_SCL_GPIO CONFIG_VIBE_BOX_I2C_SCL_GPIO
+#else
+#define VIBE_BOX_I2C_SCL_GPIO 48
+#endif
+
+#ifdef CONFIG_VIBE_BOX_CODEC_I2C_ADDR
+#define VIBE_BOX_CODEC_I2C_ADDR CONFIG_VIBE_BOX_CODEC_I2C_ADDR
+#else
+#define VIBE_BOX_CODEC_I2C_ADDR 0x18
+#endif
+
+#ifdef CONFIG_VIBE_BOX_AUDIO_PA_ENABLE_GPIO
+#define VIBE_BOX_AUDIO_PA_ENABLE_GPIO CONFIG_VIBE_BOX_AUDIO_PA_ENABLE_GPIO
+#else
+#define VIBE_BOX_AUDIO_PA_ENABLE_GPIO 42
+#endif
+
+#ifdef CONFIG_VIBE_BOX_AUDIO_PA_CONTROL_GPIO
+#define VIBE_BOX_AUDIO_PA_CONTROL_GPIO CONFIG_VIBE_BOX_AUDIO_PA_CONTROL_GPIO
+#else
+#define VIBE_BOX_AUDIO_PA_CONTROL_GPIO 46
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_MCLK_GPIO
+#define VIBE_BOX_I2S_MCLK_GPIO CONFIG_VIBE_BOX_I2S_MCLK_GPIO
+#else
+#define VIBE_BOX_I2S_MCLK_GPIO -1
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_BCLK_GPIO
+#define VIBE_BOX_I2S_BCLK_GPIO CONFIG_VIBE_BOX_I2S_BCLK_GPIO
+#else
+#define VIBE_BOX_I2S_BCLK_GPIO -1
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_WS_GPIO
+#define VIBE_BOX_I2S_WS_GPIO CONFIG_VIBE_BOX_I2S_WS_GPIO
+#else
+#define VIBE_BOX_I2S_WS_GPIO -1
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_DIN_GPIO
+#define VIBE_BOX_I2S_DIN_GPIO CONFIG_VIBE_BOX_I2S_DIN_GPIO
+#else
+#define VIBE_BOX_I2S_DIN_GPIO -1
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_SAMPLE_RATE_HZ
+#define VIBE_BOX_I2S_SAMPLE_RATE_HZ CONFIG_VIBE_BOX_I2S_SAMPLE_RATE_HZ
+#else
+#define VIBE_BOX_I2S_SAMPLE_RATE_HZ 16000
+#endif
+
+#ifdef CONFIG_VIBE_BOX_I2S_CHANNELS
+#define VIBE_BOX_I2S_CHANNELS CONFIG_VIBE_BOX_I2S_CHANNELS
+#else
+#define VIBE_BOX_I2S_CHANNELS 1
+#endif
+
+static EventGroupHandle_t s_wifi_event_group;
+static esp_netif_t *s_sta_netif;
+static esp_netif_t *s_ap_netif;
+static httpd_handle_t s_provisioning_server;
 static int s_retry_num;
+static bool s_network_stack_ready;
+static bool s_wifi_driver_ready;
+static bool s_wifi_station_started;
+static bool s_provisioning_reconnect_requested;
 
 typedef enum {
     APP_STATE_BOOT = 0,
@@ -48,6 +183,17 @@ typedef enum {
 } app_state_t;
 
 typedef struct {
+    char wifi_ssid[RUNTIME_WIFI_SSID_MAX];
+    char wifi_password[RUNTIME_WIFI_PASSWORD_MAX];
+    char server_base_url[RUNTIME_SERVER_BASE_URL_MAX];
+    char api_token[RUNTIME_API_TOKEN_MAX];
+    char device_id[RUNTIME_DEVICE_ID_MAX];
+    char firmware_version[RUNTIME_FIRMWARE_VERSION_MAX];
+    char language[RUNTIME_LANGUAGE_MAX];
+    uint32_t recording_duration_ms;
+} runtime_config_t;
+
+typedef struct {
     char request_id[QUERY_REQUEST_ID_MAX];
     char transcript[QUERY_TEXT_MAX];
     char reply_text[QUERY_REPLY_MAX];
@@ -55,7 +201,24 @@ typedef struct {
     size_t display_line_count;
 } query_result_t;
 
+typedef struct {
+    app_state_t page_state;
+    char headline[64];
+    char detail[QUERY_REPLY_MAX];
+    char lines[QUERY_DISPLAY_LINE_MAX][QUERY_DISPLAY_COL_MAX];
+    size_t line_count;
+} ui_snapshot_t;
+
+typedef struct {
+    char *buffer;
+    size_t capacity;
+    size_t length;
+    bool truncated;
+} http_response_context_t;
+
+static runtime_config_t s_runtime_config;
 static query_result_t s_last_query_result;
+static ui_snapshot_t s_ui_snapshot;
 
 static const char *app_state_name(app_state_t state)
 {
@@ -94,28 +257,74 @@ static void set_state(app_state_t *state, app_state_t next_state, const char *re
     *state = next_state;
 }
 
-static void log_runtime_config(void)
+static void runtime_config_load_defaults(runtime_config_t *cfg)
+{
+    memset(cfg, 0, sizeof(*cfg));
+    strlcpy(cfg->wifi_ssid, CONFIG_VIBE_BOX_WIFI_SSID, sizeof(cfg->wifi_ssid));
+    strlcpy(cfg->wifi_password, CONFIG_VIBE_BOX_WIFI_PASSWORD, sizeof(cfg->wifi_password));
+    strlcpy(cfg->server_base_url,
+            CONFIG_VIBE_BOX_SERVER_BASE_URL,
+            sizeof(cfg->server_base_url));
+    strlcpy(cfg->api_token, VIBE_BOX_DEFAULT_API_TOKEN, sizeof(cfg->api_token));
+    strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
+    strlcpy(cfg->firmware_version,
+            CONFIG_VIBE_BOX_FIRMWARE_VERSION,
+            sizeof(cfg->firmware_version));
+    strlcpy(cfg->language, VIBE_BOX_DEFAULT_LANGUAGE, sizeof(cfg->language));
+    cfg->recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+}
+
+static bool runtime_config_is_complete(const runtime_config_t *cfg)
+{
+    return cfg->wifi_ssid[0] != '\0' && cfg->server_base_url[0] != '\0';
+}
+
+static void log_runtime_config(const runtime_config_t *cfg, const char *source)
 {
     ESP_LOGI(TAG, "firmware startup diagnostics");
+    ESP_LOGI(TAG, "  config_source=%s", source);
     ESP_LOGI(TAG, "  project=vibe_box");
     ESP_LOGI(TAG, "  free_heap=%" PRIu32, esp_get_free_heap_size());
-    ESP_LOGI(TAG, "  wifi_ssid=%s", strlen(CONFIG_VIBE_BOX_WIFI_SSID) ? CONFIG_VIBE_BOX_WIFI_SSID : "<empty>");
+    ESP_LOGI(TAG, "  wifi_ssid=%s", cfg->wifi_ssid[0] ? cfg->wifi_ssid : "<empty>");
+    ESP_LOGI(TAG, "  wifi_password=%s", cfg->wifi_password[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG, "  server_base_url=%s", cfg->server_base_url[0] ? cfg->server_base_url : "<empty>");
+    ESP_LOGI(TAG, "  api_token=%s", cfg->api_token[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG, "  device_id=%s", cfg->device_id[0] ? cfg->device_id : "<empty>");
     ESP_LOGI(TAG,
-             "  wifi_password=%s",
-             strlen(CONFIG_VIBE_BOX_WIFI_PASSWORD) ? "<configured>" : "<empty>");
-    ESP_LOGI(TAG, "  device_id=%s", CONFIG_VIBE_BOX_DEVICE_ID);
-    ESP_LOGI(TAG, "  firmware_version=%s", CONFIG_VIBE_BOX_FIRMWARE_VERSION);
-    ESP_LOGI(TAG, "  server_base_url=%s", CONFIG_VIBE_BOX_SERVER_BASE_URL);
+             "  firmware_version=%s",
+             cfg->firmware_version[0] ? cfg->firmware_version : "<empty>");
+    ESP_LOGI(TAG, "  language=%s", cfg->language[0] ? cfg->language : "<empty>");
+    ESP_LOGI(TAG, "  recording_duration_ms=%" PRIu32, cfg->recording_duration_ms);
     ESP_LOGI(TAG, "  health_poll_interval_ms=%d", CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
     ESP_LOGI(TAG, "  demo_query_enabled=%d", CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY);
+    ESP_LOGI(TAG, "  demo_audio_upload_enabled=%d", VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD);
+    ESP_LOGI(TAG, "  i2s_capture_enabled=%d", VIBE_BOX_ENABLE_I2S_CAPTURE);
     ESP_LOGI(TAG, "  demo_query_text=%s", CONFIG_VIBE_BOX_DEMO_QUERY_TEXT);
+    ESP_LOGI(TAG, "  demo_audio_duration_ms=%d", CONFIG_VIBE_BOX_DEMO_AUDIO_DURATION_MS);
+    ESP_LOGI(TAG, "  demo_audio_tone_hz=%d", CONFIG_VIBE_BOX_DEMO_AUDIO_TONE_HZ);
+    ESP_LOGI(TAG, "  i2c_port=%d", VIBE_BOX_I2C_PORT);
+    ESP_LOGI(TAG, "  i2c_sda_gpio=%d", VIBE_BOX_I2C_SDA_GPIO);
+    ESP_LOGI(TAG, "  i2c_scl_gpio=%d", VIBE_BOX_I2C_SCL_GPIO);
+    ESP_LOGI(TAG, "  codec_i2c_addr=0x%02x", VIBE_BOX_CODEC_I2C_ADDR);
+    ESP_LOGI(TAG, "  pa_enable_gpio=%d", VIBE_BOX_AUDIO_PA_ENABLE_GPIO);
+    ESP_LOGI(TAG, "  pa_control_gpio=%d", VIBE_BOX_AUDIO_PA_CONTROL_GPIO);
+    ESP_LOGI(TAG, "  i2s_port=%d", VIBE_BOX_I2S_PORT);
+    ESP_LOGI(TAG, "  i2s_mclk_gpio=%d", VIBE_BOX_I2S_MCLK_GPIO);
+    ESP_LOGI(TAG, "  i2s_bclk_gpio=%d", VIBE_BOX_I2S_BCLK_GPIO);
+    ESP_LOGI(TAG, "  i2s_ws_gpio=%d", VIBE_BOX_I2S_WS_GPIO);
+    ESP_LOGI(TAG, "  i2s_din_gpio=%d", VIBE_BOX_I2S_DIN_GPIO);
+    ESP_LOGI(TAG, "  i2s_sample_rate_hz=%d", VIBE_BOX_I2S_SAMPLE_RATE_HZ);
+    ESP_LOGI(TAG, "  i2s_channels=%d", VIBE_BOX_I2S_CHANNELS);
+    ESP_LOGI(TAG, "  demo_temperature=%s", CONFIG_VIBE_BOX_DEMO_TEMPERATURE);
+    ESP_LOGI(TAG, "  demo_humidity=%s", CONFIG_VIBE_BOX_DEMO_HUMIDITY);
     ESP_LOGI(TAG, "  query_poll_interval_ms=%d", CONFIG_VIBE_BOX_QUERY_POLL_INTERVAL_MS);
     ESP_LOGI(TAG, "  wifi_maximum_retry=%d", CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY);
+    ESP_LOGI(TAG, "  provisioning_ap_ssid=%s", CONFIG_VIBE_BOX_PROVISIONING_AP_SSID);
 }
 
 static void log_todo_modules(void)
 {
-    ESP_LOGI(TAG, "pending modules: ui_epaper, audio_input, sensors, storage");
+    ESP_LOGI(TAG, "pending modules: ui_epaper, touch input, sensors");
 }
 
 static esp_err_t storage_init(void)
@@ -128,8 +337,117 @@ static esp_err_t storage_init(void)
     return err;
 }
 
+static void nvs_load_string_or_default(nvs_handle_t handle,
+                                       const char *key,
+                                       char *dst,
+                                       size_t dst_size)
+{
+    size_t required = dst_size;
+
+    if (nvs_get_str(handle, key, dst, &required) != ESP_OK) {
+        return;
+    }
+}
+
+static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded_from_nvs)
+{
+    nvs_handle_t handle;
+    esp_err_t err;
+
+    runtime_config_load_defaults(cfg);
+    *loaded_from_nvs = false;
+
+    err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &handle);
+    if (err == ESP_ERR_NVS_NOT_FOUND) {
+        return ESP_OK;
+    }
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    nvs_load_string_or_default(handle, "wifi_ssid", cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
+    nvs_load_string_or_default(handle, "wifi_pass", cfg->wifi_password, sizeof(cfg->wifi_password));
+    nvs_load_string_or_default(handle, "server_url", cfg->server_base_url, sizeof(cfg->server_base_url));
+    nvs_load_string_or_default(handle, "api_token", cfg->api_token, sizeof(cfg->api_token));
+    nvs_load_string_or_default(handle, "device_id", cfg->device_id, sizeof(cfg->device_id));
+    nvs_load_string_or_default(handle, "fw_ver", cfg->firmware_version, sizeof(cfg->firmware_version));
+    nvs_load_string_or_default(handle, "language", cfg->language, sizeof(cfg->language));
+    {
+        uint32_t value = 0;
+
+        if (nvs_get_u32(handle, "rec_ms", &value) == ESP_OK && value > 0U) {
+            cfg->recording_duration_ms = value;
+        }
+    }
+    nvs_close(handle);
+
+    *loaded_from_nvs = true;
+    return ESP_OK;
+}
+
+static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = nvs_set_str(handle, "wifi_ssid", cfg->wifi_ssid);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save wifi_ssid failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "wifi_pass", cfg->wifi_password);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save wifi_pass failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "server_url", cfg->server_base_url);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save server_url failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "api_token", cfg->api_token);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save api_token failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "device_id", cfg->device_id);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save device_id failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "fw_ver", cfg->firmware_version);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save fw_ver failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "language", cfg->language);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save language failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u32(handle, "rec_ms", cfg->recording_duration_ms);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save rec_ms failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_commit(handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "commit config failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+
+exit:
+    nvs_close(handle);
+    return err;
+}
+
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
+    http_response_context_t *response_ctx = (http_response_context_t *)evt->user_data;
+
     switch (evt->event_id) {
     case HTTP_EVENT_ERROR:
         ESP_LOGW(TAG, "http event: error");
@@ -145,6 +463,20 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
         break;
     case HTTP_EVENT_ON_DATA:
         ESP_LOGI(TAG, "http event: data len=%d", evt->data_len);
+        if (response_ctx != NULL && response_ctx->buffer != NULL && response_ctx->capacity > 0U &&
+            evt->data != NULL && evt->data_len > 0) {
+            size_t available = response_ctx->capacity - response_ctx->length - 1U;
+            size_t to_copy = ((size_t)evt->data_len < available) ? (size_t)evt->data_len : available;
+
+            if (to_copy > 0U) {
+                memcpy(response_ctx->buffer + response_ctx->length, evt->data, to_copy);
+                response_ctx->length += to_copy;
+                response_ctx->buffer[response_ctx->length] = '\0';
+            }
+            if (to_copy < (size_t)evt->data_len) {
+                response_ctx->truncated = true;
+            }
+        }
         break;
     case HTTP_EVENT_ON_FINISH:
         ESP_LOGI(TAG, "http event: finish");
@@ -176,6 +508,7 @@ static void wifi_event_handler(void *arg,
         const wifi_event_sta_disconnected_t *event =
             (const wifi_event_sta_disconnected_t *)event_data;
 
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGW(TAG,
                  "wifi event: disconnected reason=%d retry=%d/%d",
                  event ? event->reason : -1,
@@ -184,13 +517,25 @@ static void wifi_event_handler(void *arg,
         if (s_retry_num < CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY) {
             esp_wifi_connect();
             s_retry_num++;
-            ESP_LOGW(TAG, "Wi-Fi disconnected, retrying (%d/%d)",
-                     s_retry_num, CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY);
+            ESP_LOGW(TAG,
+                     "Wi-Fi disconnected, retrying (%d/%d)",
+                     s_retry_num,
+                     CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY);
             return;
         }
 
-        xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
         ESP_LOGE(TAG, "Wi-Fi connect failed after %d retries", CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY);
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_START) {
+        ESP_LOGI(TAG, "wifi event: provisioning ap started");
+        return;
+    }
+
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_AP_STOP) {
+        ESP_LOGI(TAG, "wifi event: provisioning ap stopped");
         return;
     }
 
@@ -198,7 +543,8 @@ static void wifi_event_handler(void *arg,
         const ip_event_got_ip_t *event = (const ip_event_got_ip_t *)event_data;
 
         s_retry_num = 0;
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        xEventGroupClearBits(s_wifi_event_group, WIFI_FAIL_BIT);
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG,
                  "wifi event: got ip ip=" IPSTR " netmask=" IPSTR " gw=" IPSTR,
                  IP2STR(&event->ip_info.ip),
@@ -207,73 +553,127 @@ static void wifi_event_handler(void *arg,
     }
 }
 
-static esp_err_t wifi_init_sta(void)
+static esp_err_t wifi_init_once(void)
 {
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
+    esp_err_t err;
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+
+    if (s_wifi_event_group == NULL) {
+        s_wifi_event_group = xEventGroupCreate();
+        if (s_wifi_event_group == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (!s_network_stack_ready) {
+        ESP_LOGI(TAG, "initializing esp_netif");
+        ESP_RETURN_ON_ERROR(esp_netif_init(), TAG, "esp_netif_init failed");
+
+        err = esp_event_loop_create_default();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            return err;
+        }
+
+        s_sta_netif = esp_netif_create_default_wifi_sta();
+        s_ap_netif = esp_netif_create_default_wifi_ap();
+        if (s_sta_netif == NULL || s_ap_netif == NULL) {
+            return ESP_FAIL;
+        }
+        s_network_stack_ready = true;
+    }
+
+    if (!s_wifi_driver_ready) {
+        ESP_RETURN_ON_ERROR(esp_wifi_init(&cfg), TAG, "esp_wifi_init failed");
+        ESP_RETURN_ON_ERROR(
+            esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL),
+            TAG,
+            "register wifi handler failed");
+        ESP_RETURN_ON_ERROR(
+            esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL),
+            TAG,
+            "register ip handler failed");
+        s_wifi_driver_ready = true;
+    }
+
+    return ESP_OK;
+}
+
+static bool wifi_is_connected(void)
+{
+    if (s_wifi_event_group == NULL) {
+        return false;
+    }
+
+    return (xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0;
+}
+
+static esp_err_t wifi_stop_if_running(void)
+{
+    esp_err_t err;
+
+    if (!s_wifi_driver_ready || !s_wifi_station_started) {
+        return ESP_OK;
+    }
+
+    err = esp_wifi_stop();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_STOP_STATE) {
+        return err;
+    }
+
+    s_wifi_station_started = false;
+    return ESP_OK;
+}
+
+static esp_err_t wifi_start_station(const runtime_config_t *cfg)
+{
     wifi_config_t wifi_config = {0};
 
-    if (strlen(CONFIG_VIBE_BOX_WIFI_SSID) == 0U) {
+    if (cfg->wifi_ssid[0] == '\0') {
         ESP_LOGW(TAG, "Wi-Fi SSID not configured; staying in provisioning state");
         return ESP_ERR_INVALID_STATE;
     }
 
-    wifi_event_group = xEventGroupCreate();
-    if (wifi_event_group == NULL) {
-        ESP_LOGE(TAG, "failed to create wifi event group");
-        return ESP_ERR_NO_MEM;
-    }
+    ESP_RETURN_ON_ERROR(wifi_init_once(), TAG, "wifi init failed");
+    ESP_RETURN_ON_ERROR(wifi_stop_if_running(), TAG, "wifi stop failed");
 
-    ESP_LOGI(TAG, "initializing esp_netif");
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_LOGI(TAG, "creating default event loop");
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_LOGI(TAG, "creating default wifi station netif");
-    esp_netif_create_default_wifi_sta();
-    ESP_LOGI(TAG, "initializing esp_wifi");
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    s_retry_num = 0;
 
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
-
-    strlcpy((char *)wifi_config.sta.ssid, CONFIG_VIBE_BOX_WIFI_SSID, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password,
-            CONFIG_VIBE_BOX_WIFI_PASSWORD,
-            sizeof(wifi_config.sta.password));
-    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    strlcpy((char *)wifi_config.sta.ssid, cfg->wifi_ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, cfg->wifi_password, sizeof(wifi_config.sta.password));
+    wifi_config.sta.threshold.authmode =
+        cfg->wifi_password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 
     ESP_LOGI(TAG, "setting wifi mode to STA");
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_LOGI(TAG, "applying wifi config");
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
-    ESP_LOGI(TAG, "starting wifi");
-    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode sta failed");
+    ESP_LOGI(TAG, "applying station config ssid=%s", cfg->wifi_ssid);
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set sta config failed");
+    ESP_LOGI(TAG, "starting wifi station");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start wifi sta failed");
 
-    ESP_LOGI(TAG, "wifi_init_sta finished, connecting to SSID '%s'", CONFIG_VIBE_BOX_WIFI_SSID);
+    s_wifi_station_started = true;
     return ESP_OK;
 }
 
 static bool wait_for_wifi_connection(TickType_t timeout_ticks)
 {
-    ESP_LOGI(TAG, "waiting for wifi connection timeout_ms=%" PRIu32, pdTICKS_TO_MS(timeout_ticks));
-    EventBits_t bits = xEventGroupWaitBits(
-        wifi_event_group,
-        WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-        pdFALSE,
-        pdFALSE,
-        timeout_ticks);
+    EventBits_t bits;
 
-    if (bits & WIFI_CONNECTED_BIT) {
+    ESP_LOGI(TAG, "waiting for wifi connection timeout_ms=%" PRIu32, pdTICKS_TO_MS(timeout_ticks));
+    bits = xEventGroupWaitBits(s_wifi_event_group,
+                               WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                               pdFALSE,
+                               pdFALSE,
+                               timeout_ticks);
+
+    if ((bits & WIFI_CONNECTED_BIT) != 0) {
         ESP_LOGI(TAG, "Wi-Fi connected");
         return true;
     }
 
-    if (bits & WIFI_FAIL_BIT) {
+    if ((bits & WIFI_FAIL_BIT) != 0) {
         ESP_LOGE(TAG, "Wi-Fi failed");
         return false;
     }
@@ -282,9 +682,61 @@ static bool wait_for_wifi_connection(TickType_t timeout_ticks)
     return false;
 }
 
+static esp_err_t wifi_start_provisioning_ap(void)
+{
+    wifi_config_t wifi_config = {0};
+    esp_netif_ip_info_t ip_info = {0};
+    const char *password = CONFIG_VIBE_BOX_PROVISIONING_AP_PASSWORD;
+
+    ESP_RETURN_ON_ERROR(wifi_init_once(), TAG, "wifi init failed");
+    ESP_RETURN_ON_ERROR(wifi_stop_if_running(), TAG, "wifi stop failed");
+
+    xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+
+    strlcpy((char *)wifi_config.ap.ssid,
+            CONFIG_VIBE_BOX_PROVISIONING_AP_SSID,
+            sizeof(wifi_config.ap.ssid));
+    strlcpy((char *)wifi_config.ap.password, password, sizeof(wifi_config.ap.password));
+    wifi_config.ap.channel = 1;
+    wifi_config.ap.max_connection = 4;
+    wifi_config.ap.authmode = password[0] ? WIFI_AUTH_WPA_WPA2_PSK : WIFI_AUTH_OPEN;
+    wifi_config.ap.ssid_len = (uint8_t)strlen(CONFIG_VIBE_BOX_PROVISIONING_AP_SSID);
+
+    ESP_LOGI(TAG, "setting wifi mode to AP for provisioning");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_AP), TAG, "set mode ap failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_AP, &wifi_config), TAG, "set ap config failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start wifi ap failed");
+
+    s_wifi_station_started = true;
+
+    if (esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "provisioning ap ready ssid=%s password=%s ip=" IPSTR,
+                 CONFIG_VIBE_BOX_PROVISIONING_AP_SSID,
+                 password[0] ? "<configured>" : "<open>",
+                 IP2STR(&ip_info.ip));
+    }
+
+    return ESP_OK;
+}
+
 static char hex_digit(unsigned value)
 {
     return (value < 10U) ? (char)('0' + value) : (char)('A' + (value - 10U));
+}
+
+static int hex_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 10 + (ch - 'A');
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + (ch - 'a');
+    }
+    return -1;
 }
 
 static bool is_unreserved_uri_char(unsigned char ch)
@@ -297,7 +749,7 @@ static size_t url_encode_component(const char *src, char *dst, size_t dst_len)
     size_t out = 0;
 
     if (dst_len == 0U) {
-        return 0;
+        return URL_ENCODE_ERROR;
     }
 
     while (*src != '\0') {
@@ -305,14 +757,14 @@ static size_t url_encode_component(const char *src, char *dst, size_t dst_len)
 
         if (is_unreserved_uri_char(ch)) {
             if ((out + 1U) >= dst_len) {
-                return 0;
+                return URL_ENCODE_ERROR;
             }
             dst[out++] = (char)ch;
             continue;
         }
 
         if ((out + 3U) >= dst_len) {
-            return 0;
+            return URL_ENCODE_ERROR;
         }
         dst[out++] = '%';
         dst[out++] = hex_digit((unsigned)(ch >> 4));
@@ -323,30 +775,145 @@ static size_t url_encode_component(const char *src, char *dst, size_t dst_len)
     return out;
 }
 
-static esp_err_t perform_http_request(const char *path,
+static bool url_decode_component(const char *src, size_t src_len, char *dst, size_t dst_len)
+{
+    size_t i;
+    size_t out = 0;
+
+    if (dst_len == 0U) {
+        return false;
+    }
+
+    for (i = 0; i < src_len; ++i) {
+        char ch = src[i];
+
+        if (ch == '+') {
+            if ((out + 1U) >= dst_len) {
+                return false;
+            }
+            dst[out++] = ' ';
+            continue;
+        }
+
+        if (ch == '%' && (i + 2U) < src_len) {
+            int high = hex_value(src[i + 1U]);
+            int low = hex_value(src[i + 2U]);
+
+            if (high < 0 || low < 0) {
+                return false;
+            }
+            if ((out + 1U) >= dst_len) {
+                return false;
+            }
+            dst[out++] = (char)((high << 4) | low);
+            i += 2U;
+            continue;
+        }
+
+        if ((out + 1U) >= dst_len) {
+            return false;
+        }
+        dst[out++] = ch;
+    }
+
+    dst[out] = '\0';
+    return true;
+}
+
+static bool extract_form_value(const char *body, const char *key, char *dst, size_t dst_len)
+{
+    const char *cursor = body;
+    size_t key_len = strlen(key);
+
+    if (dst_len == 0U) {
+        return false;
+    }
+    dst[0] = '\0';
+
+    while (*cursor != '\0') {
+        const char *segment_end = strchr(cursor, '&');
+        const char *equals;
+        size_t segment_len;
+
+        if (segment_end == NULL) {
+            segment_end = cursor + strlen(cursor);
+        }
+
+        segment_len = (size_t)(segment_end - cursor);
+        equals = memchr(cursor, '=', segment_len);
+        if (equals != NULL && (size_t)(equals - cursor) == key_len &&
+            strncmp(cursor, key, key_len) == 0) {
+            return url_decode_component(equals + 1,
+                                        (size_t)(segment_end - (equals + 1)),
+                                        dst,
+                                        dst_len);
+        }
+
+        if (*segment_end == '\0') {
+            break;
+        }
+        cursor = segment_end + 1;
+    }
+
+    return false;
+}
+
+static bool extract_form_u32(const char *body, const char *key, uint32_t *value_out)
+{
+    char decoded[32];
+    char *end = NULL;
+    unsigned long parsed;
+
+    if (value_out == NULL) {
+        return false;
+    }
+
+    if (!extract_form_value(body, key, decoded, sizeof(decoded)) || decoded[0] == '\0') {
+        return false;
+    }
+
+    parsed = strtoul(decoded, &end, 10);
+    if (end == NULL || *end != '\0' || parsed == 0UL || parsed > UINT32_MAX) {
+        return false;
+    }
+
+    *value_out = (uint32_t)parsed;
+    return true;
+}
+
+static esp_err_t perform_http_request(const runtime_config_t *cfg,
+                                      const char *path,
                                       esp_http_client_method_t method,
                                       const char *content_type,
-                                      const char *body,
+                                      const uint8_t *body,
+                                      size_t body_len,
                                       char *response_buf,
                                       size_t response_buf_size,
                                       int *status_out)
 {
     char url[URL_BUFFER_SIZE];
+    http_response_context_t response_ctx = {
+        .buffer = response_buf,
+        .capacity = response_buf_size,
+        .length = 0U,
+        .truncated = false,
+    };
     esp_http_client_config_t config = {
         .url = url,
         .method = method,
         .event_handler = http_event_handler,
         .timeout_ms = 5000,
+        .user_data = (response_buf != NULL && response_buf_size > 0U) ? &response_ctx : NULL,
     };
 
-    if (snprintf(url, sizeof(url), "%s%s", CONFIG_VIBE_BOX_SERVER_BASE_URL, path) >= (int)sizeof(url)) {
+    if (snprintf(url, sizeof(url), "%s%s", cfg->server_base_url, path) >= (int)sizeof(url)) {
         ESP_LOGE(TAG, "server URL too long path=%s", path);
         return ESP_ERR_INVALID_SIZE;
     }
 
     ESP_LOGI(TAG, "http request begin method=%d url=%s", method, url);
     if (body != NULL) {
-        ESP_LOGI(TAG, "http request body=%s", body);
+        ESP_LOGI(TAG, "http request body_len=%u", (unsigned)body_len);
     }
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -358,8 +925,16 @@ static esp_err_t perform_http_request(const char *path,
     if (content_type != NULL) {
         ESP_ERROR_CHECK(esp_http_client_set_header(client, "Content-Type", content_type));
     }
-    if (body != NULL) {
-        ESP_ERROR_CHECK(esp_http_client_set_post_field(client, body, (int)strlen(body)));
+    if (cfg->api_token[0] != '\0') {
+        char bearer_header[256];
+
+        if (snprintf(bearer_header, sizeof(bearer_header), "Bearer %s", cfg->api_token) <
+            (int)sizeof(bearer_header)) {
+            ESP_ERROR_CHECK(esp_http_client_set_header(client, "Authorization", bearer_header));
+        }
+    }
+    if (body != NULL && body_len > 0U) {
+        ESP_ERROR_CHECK(esp_http_client_set_post_field(client, (const char *)body, (int)body_len));
     }
 
     esp_err_t err = esp_http_client_perform(client);
@@ -370,12 +945,11 @@ static esp_err_t perform_http_request(const char *path,
     }
 
     if (err == ESP_OK && response_buf != NULL && response_buf_size > 0U) {
-        int len = esp_http_client_read_response(client, response_buf, response_buf_size - 1U);
-        if (len < 0) {
-            len = 0;
-        }
-        response_buf[len] = '\0';
+        response_buf[response_ctx.length] = '\0';
         ESP_LOGI(TAG, "http response status=%d body=%s", status, response_buf);
+        if (response_ctx.truncated) {
+            ESP_LOGW(TAG, "http response body truncated capacity=%u", (unsigned)response_buf_size);
+        }
     } else if (err != ESP_OK) {
         ESP_LOGE(TAG, "http request failed err=%s status=%d", esp_err_to_name(err), status);
     }
@@ -393,24 +967,51 @@ static esp_err_t perform_http_request(const char *path,
     return ESP_OK;
 }
 
-static esp_err_t health_check_once(void)
+static esp_err_t health_check_once(const runtime_config_t *cfg)
 {
     char response_buf[HEALTH_RESPONSE_BUFFER_SIZE] = {0};
     int status = 0;
 
     ESP_LOGI(TAG, "health check begin");
-    return perform_http_request("/health",
-                                HTTP_METHOD_GET,
-                                NULL,
-                                NULL,
-                                response_buf,
-                                sizeof(response_buf),
-                                &status);
+    return perform_http_request(
+        cfg, "/health", HTTP_METHOD_GET, NULL, NULL, 0U, response_buf, sizeof(response_buf), &status);
 }
 
 static void clear_query_result(query_result_t *result)
 {
     memset(result, 0, sizeof(*result));
+}
+
+static void render_ui_status(app_state_t state, const char *headline, const char *detail)
+{
+    memset(&s_ui_snapshot, 0, sizeof(s_ui_snapshot));
+    s_ui_snapshot.page_state = state;
+    strlcpy(s_ui_snapshot.headline, headline, sizeof(s_ui_snapshot.headline));
+    strlcpy(s_ui_snapshot.detail, detail, sizeof(s_ui_snapshot.detail));
+
+    ESP_LOGI(TAG,
+             "ui status page=%s headline=%s detail=%s",
+             app_state_name(state),
+             s_ui_snapshot.headline,
+             s_ui_snapshot.detail);
+}
+
+static void render_ui_query_result(const query_result_t *result)
+{
+    size_t i;
+
+    memset(&s_ui_snapshot, 0, sizeof(s_ui_snapshot));
+    s_ui_snapshot.page_state = APP_STATE_DISPLAYING;
+    strlcpy(s_ui_snapshot.headline, "Vibe Box", sizeof(s_ui_snapshot.headline));
+    strlcpy(s_ui_snapshot.detail, result->reply_text, sizeof(s_ui_snapshot.detail));
+    s_ui_snapshot.line_count = result->display_line_count;
+
+    for (i = 0; i < result->display_line_count && i < QUERY_DISPLAY_LINE_MAX; ++i) {
+        strlcpy(s_ui_snapshot.lines[i], result->display_lines[i], sizeof(s_ui_snapshot.lines[i]));
+        ESP_LOGI(TAG, "ui line[%u]=%s", (unsigned)i, s_ui_snapshot.lines[i]);
+    }
+
+    ESP_LOGI(TAG, "ui result detail=%s", s_ui_snapshot.detail);
 }
 
 static void copy_json_string(cJSON *parent, const char *key, char *dst, size_t dst_size)
@@ -485,50 +1086,529 @@ static void log_query_result(const query_result_t *result)
     }
 }
 
-static esp_err_t query_server_once(query_result_t *result)
+static size_t append_text(char *dst, size_t dst_len, size_t offset, const char *text)
 {
-    char response_buf[QUERY_RESPONSE_BUFFER_SIZE] = {0};
+    int written;
+
+    if (offset >= dst_len) {
+        return 0;
+    }
+
+    written = snprintf(dst + offset, dst_len - offset, "%s", text);
+    if (written < 0 || (size_t)written >= (dst_len - offset)) {
+        return 0;
+    }
+    return offset + (size_t)written;
+}
+
+static size_t append_form_field(uint8_t *dst,
+                                size_t dst_len,
+                                size_t offset,
+                                const char *name,
+                                const char *value)
+{
+    int written = snprintf((char *)dst + offset,
+                           dst_len - offset,
+                           "--%s\r\n"
+                           "Content-Disposition: form-data; name=\"%s\"\r\n\r\n"
+                           "%s\r\n",
+                           MULTIPART_BOUNDARY,
+                           name,
+                           value);
+
+    if (written < 0 || (size_t)written >= (dst_len - offset)) {
+        return 0;
+    }
+
+    return offset + (size_t)written;
+}
+
+static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
+                                                   const uint8_t *wav_bytes,
+                                                   size_t wav_size,
+                                                   uint8_t **body_out,
+                                                   size_t *body_len_out,
+                                                   char *content_type,
+                                                   size_t content_type_len)
+{
+    static const char file_header_template[] =
+        "--" MULTIPART_BOUNDARY "\r\n"
+        "Content-Disposition: form-data; name=\"audio\"; filename=\"demo.wav\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n";
+    static const char closing_template[] = "\r\n--" MULTIPART_BOUNDARY "--\r\n";
+    size_t capacity;
+    size_t offset = 0;
+    uint8_t *body;
+
+    if (wav_bytes == NULL || wav_size == 0U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    capacity = wav_size + 4096U;
+    body = malloc(capacity);
+    if (body == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    offset = append_form_field(body, capacity, offset, "device_id", cfg->device_id);
+    offset = append_form_field(body, capacity, offset, "firmware_version", cfg->firmware_version);
+    offset = append_form_field(body, capacity, offset, "session_id", "demo-session");
+    offset = append_form_field(body, capacity, offset, "language", cfg->language);
+    offset = append_form_field(body, capacity, offset, "audio_format", "wav");
+    offset = append_form_field(body, capacity, offset, "temperature", CONFIG_VIBE_BOX_DEMO_TEMPERATURE);
+    offset = append_form_field(body, capacity, offset, "humidity", CONFIG_VIBE_BOX_DEMO_HUMIDITY);
+    {
+        char rec_ms[16];
+
+        snprintf(rec_ms, sizeof(rec_ms), "%" PRIu32, cfg->recording_duration_ms);
+        offset = append_form_field(body, capacity, offset, "recording_duration_ms", rec_ms);
+    }
+    if (offset == 0U) {
+        free(body);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    offset = append_text((char *)body, capacity, offset, file_header_template);
+    if (offset == 0U) {
+        free(body);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    memcpy(body + offset, wav_bytes, wav_size);
+    offset += wav_size;
+
+    offset = append_text((char *)body, capacity, offset, closing_template);
+    if (offset == 0U) {
+        free(body);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (snprintf(content_type,
+                 content_type_len,
+                 "multipart/form-data; boundary=%s",
+                 MULTIPART_BOUNDARY) >= (int)content_type_len) {
+        free(body);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *body_out = body;
+    *body_len_out = offset;
+    return ESP_OK;
+}
+
+static esp_err_t build_demo_audio_request_body(const runtime_config_t *cfg,
+                                               uint8_t **body_out,
+                                               size_t *body_len_out,
+                                               char *content_type,
+                                               size_t content_type_len)
+{
+    audio_input_demo_config_t audio_cfg = {
+        .sample_rate_hz = 16000,
+        .channels = 1,
+        .bits_per_sample = 16,
+        .duration_ms = CONFIG_VIBE_BOX_DEMO_AUDIO_DURATION_MS,
+        .tone_frequency_hz = (float)CONFIG_VIBE_BOX_DEMO_AUDIO_TONE_HZ,
+        .amplitude = 8000,
+    };
+    size_t wav_size = audio_input_demo_wav_size(&audio_cfg);
+    uint8_t *wav_buf;
+    size_t wav_written = 0;
+    esp_err_t err;
+
+    if (wav_size == 0U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    wav_buf = malloc(wav_size);
+    if (wav_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = audio_input_generate_demo_wav(&audio_cfg, wav_buf, wav_size, &wav_written);
+    if (err == ESP_OK) {
+        err = build_audio_upload_multipart_body(
+            cfg, wav_buf, wav_written, body_out, body_len_out, content_type, content_type_len);
+    }
+    free(wav_buf);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "built demo audio multipart body wav_bytes=%u total_bytes=%u duration_ms=%d tone_hz=%d",
+                 (unsigned)wav_written,
+                 (unsigned)*body_len_out,
+                 CONFIG_VIBE_BOX_DEMO_AUDIO_DURATION_MS,
+                 CONFIG_VIBE_BOX_DEMO_AUDIO_TONE_HZ);
+    }
+    return err;
+}
+
+static esp_err_t build_i2s_audio_request_body(const runtime_config_t *cfg,
+                                              uint8_t **body_out,
+                                              size_t *body_len_out,
+                                              char *content_type,
+                                              size_t content_type_len)
+{
+    audio_input_i2s_config_t capture_cfg = {
+        .i2s_port = VIBE_BOX_I2S_PORT,
+        .i2c_port = VIBE_BOX_I2C_PORT,
+        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
+        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
+        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
+        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
+        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
+        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
+        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
+        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
+        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
+        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
+        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
+        .bits_per_sample = 16,
+        .duration_ms = cfg->recording_duration_ms,
+    };
+    size_t wav_size = audio_input_wav_size(capture_cfg.sample_rate_hz,
+                                           capture_cfg.channels,
+                                           capture_cfg.bits_per_sample,
+                                           capture_cfg.duration_ms);
+    uint8_t *wav_buf;
+    size_t wav_written = 0;
+    esp_err_t err;
+
+    if (capture_cfg.i2c_sda_gpio < 0 || capture_cfg.i2c_scl_gpio < 0 || capture_cfg.mclk_gpio < 0 ||
+        capture_cfg.bclk_gpio < 0 || capture_cfg.ws_gpio < 0 || capture_cfg.din_gpio < 0) {
+        ESP_LOGW(TAG,
+                 "codec capture requested but pins are not configured i2c_sda=%d i2c_scl=%d mclk=%d bclk=%d ws=%d din=%d",
+                 capture_cfg.i2c_sda_gpio,
+                 capture_cfg.i2c_scl_gpio,
+                 capture_cfg.mclk_gpio,
+                 capture_cfg.bclk_gpio,
+                 capture_cfg.ws_gpio,
+                 capture_cfg.din_gpio);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (wav_size == 0U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    wav_buf = malloc(wav_size);
+    if (wav_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = audio_input_capture_i2s_wav(&capture_cfg, wav_buf, wav_size, &wav_written);
+    if (err == ESP_OK) {
+        err = build_audio_upload_multipart_body(
+            cfg, wav_buf, wav_written, body_out, body_len_out, content_type, content_type_len);
+    }
+    free(wav_buf);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "built i2s audio multipart body wav_bytes=%u total_bytes=%u duration_ms=%" PRIu32,
+                 (unsigned)wav_written,
+                 (unsigned)*body_len_out,
+                 cfg->recording_duration_ms);
+    }
+    return err;
+}
+
+static esp_err_t query_server_once(const runtime_config_t *cfg, query_result_t *result)
+{
     char encoded_device_id[128];
     char encoded_firmware_version[128];
-    char encoded_query_text[FORM_BODY_BUFFER_SIZE];
-    char form_body[FORM_BODY_BUFFER_SIZE];
+    char encoded_language[64];
+    char encoded_temperature[64];
+    char encoded_humidity[64];
+    char content_type[128];
+    char *response_buf = NULL;
+    char *encoded_query_text = NULL;
+    char *form_body = NULL;
+    uint8_t *request_body = NULL;
+    size_t request_body_len = 0;
     int status = 0;
     esp_err_t err;
 
-    if (url_encode_component(CONFIG_VIBE_BOX_DEVICE_ID, encoded_device_id, sizeof(encoded_device_id)) == 0U ||
-        url_encode_component(CONFIG_VIBE_BOX_FIRMWARE_VERSION,
-                             encoded_firmware_version,
-                             sizeof(encoded_firmware_version)) == 0U ||
-        url_encode_component(CONFIG_VIBE_BOX_DEMO_QUERY_TEXT,
-                             encoded_query_text,
-                             sizeof(encoded_query_text)) == 0U) {
-        ESP_LOGE(TAG, "failed to URL-encode form fields");
-        return ESP_ERR_INVALID_SIZE;
+    response_buf = calloc(1, QUERY_RESPONSE_BUFFER_SIZE);
+    if (response_buf == NULL) {
+        return ESP_ERR_NO_MEM;
     }
 
-    if (snprintf(form_body,
-                 sizeof(form_body),
-                 "device_id=%s&firmware_version=%s&session_id=demo-session&language=zh&audio_format=text&query_text=%s",
-                 encoded_device_id,
-                 encoded_firmware_version,
-                 encoded_query_text) >= (int)sizeof(form_body)) {
-        ESP_LOGE(TAG, "query form body too large");
-        return ESP_ERR_INVALID_SIZE;
+    if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
+        err = build_i2s_audio_request_body(
+            cfg, &request_body, &request_body_len, content_type, sizeof(content_type));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to build i2s audio request: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+    } else if (VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD) {
+        err = build_demo_audio_request_body(
+            cfg, &request_body, &request_body_len, content_type, sizeof(content_type));
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "failed to build demo audio request: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+    } else {
+        encoded_query_text = malloc(FORM_BODY_BUFFER_SIZE);
+        form_body = malloc(FORM_BODY_BUFFER_SIZE);
+        if (encoded_query_text == NULL || form_body == NULL) {
+            err = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+
+        if (url_encode_component(cfg->device_id, encoded_device_id, sizeof(encoded_device_id)) ==
+                URL_ENCODE_ERROR ||
+            url_encode_component(cfg->firmware_version,
+                                 encoded_firmware_version,
+                                 sizeof(encoded_firmware_version)) == URL_ENCODE_ERROR ||
+            url_encode_component(cfg->language, encoded_language, sizeof(encoded_language)) ==
+                URL_ENCODE_ERROR ||
+            url_encode_component(CONFIG_VIBE_BOX_DEMO_TEMPERATURE,
+                                 encoded_temperature,
+                                 sizeof(encoded_temperature)) == URL_ENCODE_ERROR ||
+            url_encode_component(CONFIG_VIBE_BOX_DEMO_HUMIDITY,
+                                 encoded_humidity,
+                                 sizeof(encoded_humidity)) == URL_ENCODE_ERROR ||
+            url_encode_component(CONFIG_VIBE_BOX_DEMO_QUERY_TEXT,
+                                 encoded_query_text,
+                                 FORM_BODY_BUFFER_SIZE) == URL_ENCODE_ERROR) {
+            ESP_LOGE(TAG, "failed to URL-encode form fields");
+            err = ESP_ERR_INVALID_SIZE;
+            goto cleanup;
+        }
+
+        if (snprintf(form_body,
+                     FORM_BODY_BUFFER_SIZE,
+                     "device_id=%s&firmware_version=%s&session_id=demo-session&language=%s&audio_format=text&temperature=%s&humidity=%s&recording_duration_ms=%" PRIu32 "&query_text=%s",
+                     encoded_device_id,
+                     encoded_firmware_version,
+                     encoded_language,
+                     encoded_temperature,
+                     encoded_humidity,
+                     cfg->recording_duration_ms,
+                     encoded_query_text) >= FORM_BODY_BUFFER_SIZE) {
+            ESP_LOGE(TAG, "query form body too large");
+            err = ESP_ERR_INVALID_SIZE;
+            goto cleanup;
+        }
+        strlcpy(content_type, "application/x-www-form-urlencoded", sizeof(content_type));
+        request_body = (uint8_t *)form_body;
+        request_body_len = strlen(form_body);
     }
 
-    err = perform_http_request("/v1/query",
+    err = perform_http_request(cfg,
+                               "/v1/query",
                                HTTP_METHOD_POST,
-                               "application/x-www-form-urlencoded",
-                               form_body,
+                               content_type,
+                               request_body,
+                               request_body_len,
                                response_buf,
-                               sizeof(response_buf),
+                               QUERY_RESPONSE_BUFFER_SIZE,
                                &status);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "query request failed status=%d err=%s", status, esp_err_to_name(err));
-        return err;
+        goto cleanup;
     }
 
-    return parse_query_response(response_buf, result);
+    err = parse_query_response(response_buf, result);
+
+cleanup:
+    if ((VIBE_BOX_ENABLE_I2S_CAPTURE || VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD) &&
+        request_body != NULL) {
+        free(request_body);
+    }
+    free(form_body);
+    free(encoded_query_text);
+    free(response_buf);
+    return err;
+}
+
+static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
+{
+    char html[PROVISIONING_HTML_BUFFER_SIZE];
+
+    snprintf(
+        html,
+        sizeof(html),
+        "<!doctype html><html><head><meta charset='utf-8'><title>Vibe Box Setup</title>"
+        "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:680px;"
+        "margin:40px auto;padding:0 16px;}input{width:100%%;padding:10px;margin:8px 0 16px;"
+        "box-sizing:border-box;}button{padding:12px 16px;}code{background:#f4f4f4;padding:2px 4px;}"
+        "</style></head><body><h1>Vibe Box Provisioning</h1>"
+        "<p>Connect the device to your Wi-Fi and thin server, then submit the form. "
+        "After saving, the device will leave <code>%s</code> and try to connect.</p>"
+        "<form method='post' action='/configure'>"
+        "<label>Wi-Fi SSID</label><input name='wifi_ssid' value='%s' maxlength='32' />"
+        "<label>Wi-Fi Password</label><input name='wifi_password' type='password' value='%s' maxlength='64' />"
+        "<label>Server Base URL</label><input name='server_base_url' value='%s' maxlength='191' />"
+        "<label>API Token</label><input name='api_token' type='password' value='%s' maxlength='191' />"
+        "<label>Device ID</label><input name='device_id' value='%s' maxlength='63' />"
+        "<label>Firmware Version</label><input name='firmware_version' value='%s' maxlength='63' />"
+        "<label>Language</label><input name='language' value='%s' maxlength='15' />"
+        "<label>Recording Duration (ms)</label><input name='recording_duration_ms' type='number' min='1000' max='15000' value='%" PRIu32 "' />"
+        "<button type='submit'>Save And Reconnect</button></form>"
+        "<p>Provisioning AP SSID: <strong>%s</strong></p></body></html>",
+        app_state_name(APP_STATE_PROVISIONING),
+        s_runtime_config.wifi_ssid,
+        s_runtime_config.wifi_password,
+        s_runtime_config.server_base_url,
+        s_runtime_config.api_token,
+        s_runtime_config.device_id,
+        s_runtime_config.firmware_version,
+        s_runtime_config.language,
+        s_runtime_config.recording_duration_ms,
+        CONFIG_VIBE_BOX_PROVISIONING_AP_SSID);
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
+{
+    char payload[PROVISIONING_STATUS_BUFFER_SIZE];
+
+    snprintf(payload,
+             sizeof(payload),
+             "{\"state\":\"%s\",\"wifi_ssid\":\"%s\",\"server_base_url\":\"%s\","
+             "\"api_token_configured\":%s,\"device_id\":\"%s\",\"firmware_version\":\"%s\","
+             "\"language\":\"%s\",\"recording_duration_ms\":%" PRIu32 "}",
+             app_state_name(APP_STATE_PROVISIONING),
+             s_runtime_config.wifi_ssid,
+             s_runtime_config.server_base_url,
+             s_runtime_config.api_token[0] ? "true" : "false",
+             s_runtime_config.device_id,
+             s_runtime_config.firmware_version,
+             s_runtime_config.language,
+             s_runtime_config.recording_duration_ms);
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, payload, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
+{
+    char body[PROVISIONING_FORM_BUFFER_SIZE];
+    runtime_config_t next_config = s_runtime_config;
+    int received = 0;
+
+    if (req->content_len <= 0 || req->content_len >= (int)sizeof(body)) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "request body too large");
+        return ESP_FAIL;
+    }
+
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req,
+                                 body + received,
+                                 (size_t)(req->content_len - received));
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to receive body");
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    body[received] = '\0';
+
+    ESP_LOGI(TAG, "provisioning form body=%s", body);
+    extract_form_value(body, "wifi_ssid", next_config.wifi_ssid, sizeof(next_config.wifi_ssid));
+    extract_form_value(body,
+                       "wifi_password",
+                       next_config.wifi_password,
+                       sizeof(next_config.wifi_password));
+    extract_form_value(body,
+                       "server_base_url",
+                       next_config.server_base_url,
+                       sizeof(next_config.server_base_url));
+    extract_form_value(body, "api_token", next_config.api_token, sizeof(next_config.api_token));
+    extract_form_value(body, "device_id", next_config.device_id, sizeof(next_config.device_id));
+    extract_form_value(body,
+                       "firmware_version",
+                       next_config.firmware_version,
+                       sizeof(next_config.firmware_version));
+    extract_form_value(body, "language", next_config.language, sizeof(next_config.language));
+    extract_form_u32(body, "recording_duration_ms", &next_config.recording_duration_ms);
+
+    if (!runtime_config_is_complete(&next_config)) {
+        httpd_resp_send_err(req,
+                            HTTPD_400_BAD_REQUEST,
+                            "wifi_ssid and server_base_url are required");
+        return ESP_FAIL;
+    }
+
+    if (next_config.device_id[0] == '\0') {
+        strlcpy(next_config.device_id, "vibe-box-dev", sizeof(next_config.device_id));
+    }
+    if (next_config.firmware_version[0] == '\0') {
+        strlcpy(next_config.firmware_version, "dev", sizeof(next_config.firmware_version));
+    }
+    if (next_config.language[0] == '\0') {
+        strlcpy(next_config.language, "zh", sizeof(next_config.language));
+    }
+    if (next_config.recording_duration_ms == 0U) {
+        next_config.recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+    }
+
+    ESP_RETURN_ON_ERROR(storage_save_runtime_config(&next_config), TAG, "failed to save config");
+    s_runtime_config = next_config;
+    s_provisioning_reconnect_requested = true;
+    log_runtime_config(&s_runtime_config, "nvs-updated");
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(
+        req,
+        "<!doctype html><html><body><h1>Saved</h1><p>Configuration stored. "
+        "The device is reconnecting now.</p></body></html>",
+        HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t start_provisioning_server(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_uri_t root = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = provisioning_root_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t status = {
+        .uri = "/status",
+        .method = HTTP_GET,
+        .handler = provisioning_status_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_uri_t configure = {
+        .uri = "/configure",
+        .method = HTTP_POST,
+        .handler = provisioning_configure_post_handler,
+        .user_ctx = NULL,
+    };
+
+    if (s_provisioning_server != NULL) {
+        return ESP_OK;
+    }
+
+    config.max_uri_handlers = 8;
+    config.stack_size = 8192;
+    config.recv_wait_timeout = 10;
+    config.send_wait_timeout = 10;
+
+    ESP_RETURN_ON_ERROR(httpd_start(&s_provisioning_server, &config), TAG, "start provisioning httpd");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_provisioning_server, &root), TAG, "register root");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_provisioning_server, &status), TAG, "register status");
+    ESP_RETURN_ON_ERROR(
+        httpd_register_uri_handler(s_provisioning_server, &configure), TAG, "register configure");
+    ESP_LOGI(TAG, "provisioning web server ready on http://192.168.4.1/");
+    return ESP_OK;
+}
+
+static void stop_provisioning_server(void)
+{
+    if (s_provisioning_server != NULL) {
+        httpd_stop(s_provisioning_server);
+        s_provisioning_server = NULL;
+        ESP_LOGI(TAG, "provisioning web server stopped");
+    }
 }
 
 static TickType_t main_loop_delay_ticks(void)
@@ -539,33 +1619,101 @@ static TickType_t main_loop_delay_ticks(void)
     return pdMS_TO_TICKS(CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
 }
 
+static esp_err_t enter_provisioning_mode(app_state_t *state, const char *reason)
+{
+    esp_err_t err;
+
+    set_state(state, APP_STATE_PROVISIONING, reason);
+    render_ui_status(*state, "Provisioning", "join AP and open 192.168.4.1");
+
+    err = wifi_start_provisioning_ap();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = start_provisioning_server();
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t connect_using_runtime_config(app_state_t *state, const char *reason)
+{
+    esp_err_t err;
+
+    stop_provisioning_server();
+
+    err = wifi_start_station(&s_runtime_config);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!wait_for_wifi_connection(pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS))) {
+        return ESP_FAIL;
+    }
+
+    set_state(state, APP_STATE_IDLE, reason);
+    render_ui_status(*state, "Idle", "wifi connected");
+    return ESP_OK;
+}
+
+static esp_err_t prepare_audio_capture_pipeline(const runtime_config_t *cfg)
+{
+    audio_input_i2s_config_t capture_cfg = {
+        .i2s_port = VIBE_BOX_I2S_PORT,
+        .i2c_port = VIBE_BOX_I2C_PORT,
+        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
+        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
+        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
+        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
+        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
+        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
+        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
+        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
+        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
+        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
+        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
+        .bits_per_sample = 16,
+        .duration_ms = cfg->recording_duration_ms,
+    };
+
+    return audio_input_prepare_i2s_capture(&capture_cfg);
+}
+
 void app_main(void)
 {
     app_state_t state = APP_STATE_BOOT;
+    bool loaded_from_nvs = false;
 
     esp_log_level_set("*", ESP_LOG_INFO);
     esp_log_level_set(TAG, ESP_LOG_INFO);
     ESP_LOGI(TAG, "vibe-box starting");
     ESP_LOGI(TAG, "app_main entered");
-    log_runtime_config();
     set_state(&state, APP_STATE_BOOT, "startup");
 
     ESP_ERROR_CHECK(storage_init());
     ESP_LOGI(TAG, "NVS ready");
+    ESP_ERROR_CHECK(storage_load_runtime_config(&s_runtime_config, &loaded_from_nvs));
+    log_runtime_config(&s_runtime_config, loaded_from_nvs ? "nvs+defaults" : "menuconfig-defaults");
 
-    {
-        esp_err_t wifi_err = wifi_init_sta();
-
-        if (wifi_err == ESP_ERR_INVALID_STATE) {
-            set_state(&state, APP_STATE_PROVISIONING, "wifi credentials missing");
+    if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
+        esp_err_t err = prepare_audio_capture_pipeline(&s_runtime_config);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "audio capture pipeline init failed: %s", esp_err_to_name(err));
         } else {
-            ESP_ERROR_CHECK(wifi_err);
-            if (wait_for_wifi_connection(pdMS_TO_TICKS(30000))) {
-                set_state(&state, APP_STATE_IDLE, "wifi connected");
-            } else {
-                set_state(&state, APP_STATE_ERROR, "wifi connect failed");
-            }
+            ESP_LOGI(TAG, "audio capture pipeline ready");
         }
+    }
+
+    if (runtime_config_is_complete(&s_runtime_config)) {
+        if (connect_using_runtime_config(&state, "wifi connected") != ESP_OK) {
+            set_state(&state, APP_STATE_ERROR, "initial wifi connect failed");
+            render_ui_status(state, "Error", "initial wifi connect failed");
+        }
+    } else {
+        ESP_ERROR_CHECK(enter_provisioning_mode(&state, "missing runtime config"));
     }
 
     log_todo_modules();
@@ -573,27 +1721,62 @@ void app_main(void)
 
     while (true) {
         if (state == APP_STATE_IDLE) {
-            if (CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY) {
-                esp_err_t err;
+            esp_err_t err;
 
-                set_state(&state, APP_STATE_UPLOADING, "starting demo /v1/query");
-                err = query_server_once(&s_last_query_result);
+            if (!wifi_is_connected()) {
+                set_state(&state, APP_STATE_ERROR, "wifi not connected");
+                render_ui_status(state, "Error", "wifi disconnected");
+                vTaskDelay(main_loop_delay_ticks());
+                continue;
+            }
+
+            if (CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY) {
+                if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
+                    set_state(&state, APP_STATE_RECORDING, "capturing codec audio");
+                    render_ui_status(state, "Recording", "capturing codec audio");
+                }
+                set_state(&state, APP_STATE_UPLOADING, "starting /v1/query");
+                render_ui_status(state,
+                                 "Uploading",
+                                 VIBE_BOX_ENABLE_I2S_CAPTURE ? "uploading recorded audio"
+                                                             : "sending demo query");
+                err = query_server_once(&s_runtime_config, &s_last_query_result);
                 if (err == ESP_OK) {
                     set_state(&state, APP_STATE_DISPLAYING, "query response stored");
                     log_query_result(&s_last_query_result);
+                    render_ui_query_result(&s_last_query_result);
                     set_state(&state, APP_STATE_IDLE, "ready for next demo query");
+                    render_ui_status(state, "Idle", "waiting for next query");
                 } else {
-                    set_state(&state, APP_STATE_ERROR, "demo /v1/query failed");
+                    set_state(&state, APP_STATE_ERROR, "/v1/query failed");
+                    render_ui_status(state, "Error", "query failed");
                 }
             } else {
-                esp_err_t err;
-
                 set_state(&state, APP_STATE_UPLOADING, "starting /health probe");
-                err = health_check_once();
+                render_ui_status(state, "Uploading", "checking /health");
+                err = health_check_once(&s_runtime_config);
                 if (err == ESP_OK) {
                     set_state(&state, APP_STATE_IDLE, "/health probe succeeded");
+                    render_ui_status(state, "Idle", "health ok");
                 } else {
                     set_state(&state, APP_STATE_ERROR, "/health probe failed");
+                    render_ui_status(state, "Error", "health failed");
+                }
+            }
+        } else if (state == APP_STATE_PROVISIONING) {
+            ESP_LOGI(TAG,
+                     "heartbeat state=%s free_heap=%" PRIu32,
+                     app_state_name(state),
+                     esp_get_free_heap_size());
+            ESP_LOGW(TAG,
+                     "provisioning hint: connect to AP '%s' and open http://192.168.4.1/",
+                     CONFIG_VIBE_BOX_PROVISIONING_AP_SSID);
+
+            if (s_provisioning_reconnect_requested) {
+                s_provisioning_reconnect_requested = false;
+                if (connect_using_runtime_config(&state, "runtime config applied") != ESP_OK) {
+                    set_state(&state, APP_STATE_ERROR, "wifi connect after provisioning failed");
+                    render_ui_status(state, "Error", "provisioned wifi connect failed");
                 }
             }
         } else {
@@ -602,11 +1785,18 @@ void app_main(void)
                      app_state_name(state),
                      esp_get_free_heap_size());
 
-            if (state == APP_STATE_PROVISIONING) {
-                ESP_LOGW(TAG, "provisioning hint: set Wi-Fi SSID/password in menuconfig");
-            } else if (state == APP_STATE_ERROR) {
-                ESP_LOGW(TAG, "error hint: verify Wi-Fi, server URL, and /v1/query or /health response");
-                set_state(&state, APP_STATE_IDLE, "automatic retry scheduled");
+            if (state == APP_STATE_ERROR) {
+                if (!runtime_config_is_complete(&s_runtime_config)) {
+                    ESP_ERROR_CHECK(enter_provisioning_mode(&state, "runtime config incomplete"));
+                } else if (wifi_is_connected()) {
+                    set_state(&state, APP_STATE_IDLE, "automatic retry scheduled");
+                    render_ui_status(state, "Idle", "automatic retry scheduled");
+                } else if (connect_using_runtime_config(&state, "recovered wifi connection") !=
+                           ESP_OK) {
+                    ESP_LOGW(TAG,
+                             "error hint: verify Wi-Fi, server URL, and /v1/query or /health response");
+                    render_ui_status(state, "Error", "waiting before reconnect retry");
+                }
             }
         }
 

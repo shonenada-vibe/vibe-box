@@ -27,11 +27,32 @@
 - `query_text`
 - `audio` 文件
 
+还支持这些设备字段：
+
+- `language`
+- `recording_duration_ms`
+- `Authorization: Bearer <token>` 请求头
+
 目前仍然是 mock 逻辑：
 
 - 如果传了 `query_text`，直接把它当作转写结果
-- 如果传了 `audio`，返回一个占位 transcript
+- 如果传了 `audio` 且配置了 `WHISPER_API_URL`，会转发到 Whisper-compatible STT
+- 如果传了 `audio` 但没配置 STT 环境变量，会返回占位 transcript
 - 再生成适合 200x200 墨水屏显示的 `display_lines`
+
+## 可选环境变量
+
+- `WHISPER_API_URL`
+- `WHISPER_API_KEY`
+- `VIBE_BOX_STT_MODEL`
+- `VIBE_BOX_STRICT_STT`
+- `VIBE_BOX_DEVICE_TOKEN`
+
+说明：
+
+- `WHISPER_API_URL` 指向一个 Whisper-compatible `/audio/transcriptions` 接口
+- `VIBE_BOX_STRICT_STT=true` 时，STT 失败会直接报错，不走 fallback transcript
+- `VIBE_BOX_DEVICE_TOKEN` 如果配置了，设备请求必须带匹配的 Bearer token
 
 ## 后续拆分
 

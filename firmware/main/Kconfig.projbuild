@@ -12,11 +12,31 @@ config VIBE_BOX_WIFI_PASSWORD
     help
         Station mode password for the device.
 
+config VIBE_BOX_PROVISIONING_AP_SSID
+    string "Provisioning AP SSID"
+    default "VibeBox-Setup"
+    help
+        SoftAP SSID exposed when runtime Wi-Fi credentials are missing or when the device
+        falls back into provisioning mode.
+
+config VIBE_BOX_PROVISIONING_AP_PASSWORD
+    string "Provisioning AP password"
+    default ""
+    help
+        Optional SoftAP password. Leave empty for an open provisioning network, or use
+        at least 8 characters for WPA/WPA2 protection.
+
 config VIBE_BOX_SERVER_BASE_URL
     string "Server base URL"
     default "http://192.168.1.100:8000"
     help
         Base URL for the thin server, for example http://192.168.1.100:8000.
+
+config VIBE_BOX_API_TOKEN
+    string "API token"
+    default ""
+    help
+        Optional bearer token sent to the thin server in the Authorization header.
 
 config VIBE_BOX_DEVICE_ID
     string "Device ID"
@@ -29,6 +49,20 @@ config VIBE_BOX_FIRMWARE_VERSION
     default "dev"
     help
         Firmware version string sent to the thin server.
+
+config VIBE_BOX_LANGUAGE
+    string "Language"
+    default "zh"
+    help
+        Default language sent to the thin server.
+
+config VIBE_BOX_RECORDING_DURATION_MS
+    int "Recording duration (ms)"
+    range 1000 15000
+    default 3000
+    help
+        Target recording duration for future real audio capture. Demo audio uploads also
+        use this value unless a dedicated demo duration is configured.
 
 config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
     int "Health poll interval (ms)"
@@ -44,11 +78,143 @@ config VIBE_BOX_ENABLE_DEMO_QUERY
         When enabled, the device sends a demo text query to /v1/query instead of only
         checking /health. This is useful before audio input is implemented.
 
+config VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD
+    bool "Enable demo audio upload"
+    default n
+    help
+        When enabled together with demo query mode, the device builds a synthetic WAV
+        sample and uploads it as multipart/form-data instead of sending query_text only.
+
+config VIBE_BOX_ENABLE_I2S_CAPTURE
+    bool "Enable I2S RX audio capture"
+    default y
+    help
+        When enabled, the device captures real audio from an I2S RX data line and uploads
+        that WAV payload from the board codec instead of a synthetic demo tone.
+
+config VIBE_BOX_I2C_PORT
+    int "Audio codec I2C port"
+    range 0 1
+    default 0
+    help
+        I2C controller index used to configure the on-board ES8311 codec.
+
+config VIBE_BOX_I2C_SDA_GPIO
+    int "Audio codec I2C SDA GPIO"
+    range -1 48
+    default 47
+    help
+        SDA GPIO connected to the board audio codec control bus.
+
+config VIBE_BOX_I2C_SCL_GPIO
+    int "Audio codec I2C SCL GPIO"
+    range -1 48
+    default 48
+    help
+        SCL GPIO connected to the board audio codec control bus.
+
+config VIBE_BOX_CODEC_I2C_ADDR
+    hex "ES8311 I2C address"
+    range 0x08 0x77
+    default 0x18
+    help
+        7-bit I2C address used by the ES8311 codec.
+
+config VIBE_BOX_AUDIO_PA_ENABLE_GPIO
+    int "Audio PA enable GPIO"
+    range -1 48
+    default 42
+    help
+        Optional GPIO that controls the external power amplifier power rail.
+
+config VIBE_BOX_AUDIO_PA_CONTROL_GPIO
+    int "Audio PA control GPIO"
+    range -1 48
+    default 46
+    help
+        Optional GPIO that controls the external power amplifier mute or enable pin.
+
+config VIBE_BOX_I2S_PORT
+    int "I2S port"
+    range 0 1
+    default 0
+    help
+        I2S controller index used for microphone capture.
+
+config VIBE_BOX_I2S_MCLK_GPIO
+    int "I2S MCLK GPIO"
+    range -1 48
+    default 14
+    help
+        Master clock GPIO connected to the on-board codec.
+
+config VIBE_BOX_I2S_BCLK_GPIO
+    int "I2S BCLK GPIO"
+    range -1 48
+    default 15
+    help
+        Bit clock GPIO for I2S capture.
+
+config VIBE_BOX_I2S_WS_GPIO
+    int "I2S WS GPIO"
+    range -1 48
+    default 17
+    help
+        Word select GPIO for I2S capture.
+
+config VIBE_BOX_I2S_DIN_GPIO
+    int "I2S DIN GPIO"
+    range -1 48
+    default 16
+    help
+        Serial data input GPIO from the codec ADC into the ESP32.
+
+config VIBE_BOX_I2S_SAMPLE_RATE_HZ
+    int "I2S sample rate (Hz)"
+    range 8000 48000
+    default 16000
+    help
+        Sample rate used for raw I2S capture.
+
+config VIBE_BOX_I2S_CHANNELS
+    int "I2S channels"
+    range 1 2
+    default 1
+    help
+        Channel count used for captured PCM data.
+
 config VIBE_BOX_DEMO_QUERY_TEXT
     string "Demo query text"
     default "你好，Vibe Box"
     help
         Text sent as query_text when demo query mode is enabled.
+
+config VIBE_BOX_DEMO_AUDIO_DURATION_MS
+    int "Demo audio duration (ms)"
+    range 250 10000
+    default 2000
+    help
+        Synthetic audio duration used for multipart upload testing before real microphone
+        capture is implemented.
+
+config VIBE_BOX_DEMO_AUDIO_TONE_HZ
+    int "Demo audio tone frequency (Hz)"
+    range 100 4000
+    default 660
+    help
+        Test tone frequency used to generate the WAV payload.
+
+config VIBE_BOX_DEMO_TEMPERATURE
+    string "Demo temperature"
+    default ""
+    help
+        Optional temperature value sent to the thin server before sensor integration exists.
+
+config VIBE_BOX_DEMO_HUMIDITY
+    string "Demo humidity"
+    default ""
+    help
+        Optional humidity value sent to the thin server before sensor integration exists.
 
 config VIBE_BOX_QUERY_POLL_INTERVAL_MS
     int "Demo query poll interval (ms)"
