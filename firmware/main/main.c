@@ -12,6 +12,7 @@
 #include "freertos/task.h"
 
 #include "audio_input.h"
+#include "ui_epaper.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_check.h"
@@ -20,6 +21,7 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "esp_wifi.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -994,6 +996,8 @@ static void render_ui_status(app_state_t state, const char *headline, const char
              app_state_name(state),
              s_ui_snapshot.headline,
              s_ui_snapshot.detail);
+
+    /* The e-paper is refreshed by ui_dashboard_task every few seconds. */
 }
 
 static void render_ui_query_result(const query_result_t *result)
@@ -1012,6 +1016,8 @@ static void render_ui_query_result(const query_result_t *result)
     }
 
     ESP_LOGI(TAG, "ui result detail=%s", s_ui_snapshot.detail);
+
+    /* The e-paper is refreshed by ui_dashboard_task every few seconds. */
 }
 
 static void copy_json_string(cJSON *parent, const char *key, char *dst, size_t dst_size)
@@ -1682,6 +1688,139 @@ static esp_err_t prepare_audio_capture_pipeline(const runtime_config_t *cfg)
     return audio_input_prepare_i2s_capture(&capture_cfg);
 }
 
+#define UI_DASHBOARD_REFRESH_MS 3000
+
+static void ui_dashboard_render_once(void)
+{
+    if (!ui_epaper_is_ready()) {
+        return;
+    }
+
+    ui_epaper_clear();
+
+    char line[UI_EPAPER_MAX_COLS + 1];
+    int y = 4;
+    const int line_step = 8;       /* 8x8 font, no extra leading */
+    const int section_step = 10;   /* extra spacing after a section */
+    const int x = 4;
+
+    /* Header: Vibe Box [state] */
+    snprintf(line, sizeof(line), "Vibe Box [%s]", app_state_name(s_ui_snapshot.page_state));
+    ui_epaper_draw_text(x, y, line);
+    y += line_step + 1;
+    ui_epaper_draw_hline(y, x, UI_EPAPER_WIDTH - x - 1);
+    y += 3;
+
+    /* Wi-Fi block */
+    bool connected = wifi_is_connected();
+    ui_epaper_draw_text(x, y, connected ? "WiFi: connected" : "WiFi: disconnected");
+    y += line_step;
+
+    if (connected) {
+        wifi_ap_record_t ap = {0};
+        const char *ssid = s_runtime_config.wifi_ssid;
+        int rssi = 0;
+        bool have_rssi = false;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+            if (ap.ssid[0] != '\0') {
+                ssid = (const char *)ap.ssid;
+            }
+            rssi = ap.rssi;
+            have_rssi = true;
+        }
+        snprintf(line, sizeof(line), "SSID:%.20s", ssid);
+        ui_epaper_draw_text(x, y, line);
+        y += line_step;
+
+        esp_netif_ip_info_t ip_info = {0};
+        if (s_sta_netif != NULL && esp_netif_get_ip_info(s_sta_netif, &ip_info) == ESP_OK) {
+            snprintf(line, sizeof(line), "IP: " IPSTR, IP2STR(&ip_info.ip));
+        } else {
+            snprintf(line, sizeof(line), "IP: -");
+        }
+        ui_epaper_draw_text(x, y, line);
+        y += line_step;
+
+        if (have_rssi) {
+            snprintf(line, sizeof(line), "RSSI: %ddBm", rssi);
+            ui_epaper_draw_text(x, y, line);
+            y += line_step;
+        }
+    } else {
+        snprintf(line, sizeof(line), "AP:%.20s", s_runtime_config.wifi_ssid);
+        ui_epaper_draw_text(x, y, line);
+        y += line_step;
+    }
+
+    y += section_step - line_step;
+    ui_epaper_draw_hline(y, x, UI_EPAPER_WIDTH - x - 1);
+    y += 3;
+
+    /* API result block */
+    ui_epaper_draw_text(x, y, "Result:");
+    y += line_step;
+
+    bool any_result = false;
+    if (s_last_query_result.transcript[0] != '\0') {
+        snprintf(line, sizeof(line), "Q:%.21s", s_last_query_result.transcript);
+        ui_epaper_draw_text(x, y, line);
+        y += line_step;
+        any_result = true;
+    }
+    if (s_last_query_result.reply_text[0] != '\0') {
+        snprintf(line, sizeof(line), "A:%.21s", s_last_query_result.reply_text);
+        ui_epaper_draw_text(x, y, line);
+        y += line_step;
+        any_result = true;
+    }
+    for (size_t i = 0; i < s_last_query_result.display_line_count; ++i) {
+        if (y + line_step > UI_EPAPER_HEIGHT - 12) {
+            break;
+        }
+        snprintf(line, sizeof(line), "%.23s", s_last_query_result.display_lines[i]);
+        ui_epaper_draw_text(x, y, line);
+        y += line_step;
+        any_result = true;
+    }
+    if (!any_result) {
+        if (s_ui_snapshot.detail[0] != '\0') {
+            snprintf(line, sizeof(line), "%.23s", s_ui_snapshot.detail);
+            ui_epaper_draw_text(x, y, line);
+        } else {
+            ui_epaper_draw_text(x, y, "(no result yet)");
+        }
+        y += line_step;
+    }
+
+    /* Footer: heap + uptime */
+    int footer_y = UI_EPAPER_HEIGHT - line_step - 2;
+    ui_epaper_draw_hline(footer_y - 3, x, UI_EPAPER_WIDTH - x - 1);
+    int64_t uptime_s = esp_timer_get_time() / 1000000;
+    snprintf(line, sizeof(line),
+             "up:%llds heap:%luK",
+             (long long)uptime_s,
+             (unsigned long)(esp_get_free_heap_size() / 1024));
+    ui_epaper_draw_text(x, footer_y, line);
+
+    esp_err_t err = ui_epaper_flush();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "epaper flush failed: %s", esp_err_to_name(err));
+    } else {
+        ESP_LOGD(TAG, "epaper dashboard refreshed");
+    }
+}
+
+static void ui_dashboard_task(void *arg)
+{
+    (void)arg;
+    const TickType_t period = pdMS_TO_TICKS(UI_DASHBOARD_REFRESH_MS);
+    TickType_t last_wake = xTaskGetTickCount();
+    while (true) {
+        ui_dashboard_render_once();
+        vTaskDelayUntil(&last_wake, period);
+    }
+}
+
 void app_main(void)
 {
     app_state_t state = APP_STATE_BOOT;
@@ -1692,6 +1831,20 @@ void app_main(void)
     ESP_LOGI(TAG, "vibe-box starting");
     ESP_LOGI(TAG, "app_main entered");
     set_state(&state, APP_STATE_BOOT, "startup");
+
+    {
+        esp_err_t epd_err = ui_epaper_init();
+        if (epd_err != ESP_OK) {
+            ESP_LOGE(TAG, "ui_epaper_init failed: %s", esp_err_to_name(epd_err));
+        } else {
+            ui_epaper_show_status("Vibe Box", "boot ok, init...");
+            BaseType_t task_ok = xTaskCreatePinnedToCore(
+                ui_dashboard_task, "ui_dash", 4096, NULL, 3, NULL, tskNO_AFFINITY);
+            if (task_ok != pdPASS) {
+                ESP_LOGE(TAG, "failed to create ui_dashboard_task");
+            }
+        }
+    }
 
     ESP_ERROR_CHECK(storage_init());
     ESP_LOGI(TAG, "NVS ready");
