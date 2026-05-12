@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
@@ -11,8 +12,16 @@ from provider_adapter import fake_transcribe
 from response_shaper import build_display_lines, build_reply_text
 from tts_proxy import build_speak_text
 
+logging.basicConfig(
+    level=os.environ.get("VIBE_BOX_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 app = FastAPI(title="vibe-box-server", version="0.1.0")
 logger = logging.getLogger("vibe_box.server")
+logger.setLevel(logging.INFO)
+
+AUDIO_CACHE_DIR = Path(__file__).resolve().parent / ".cache"
 
 
 def _check_auth(authorization: str | None) -> None:
@@ -64,6 +73,12 @@ async def query(
         len(audio_bytes),
         "present" if authorization else "missing",
     )
+
+    if audio_bytes:
+        AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path = AUDIO_CACHE_DIR / f"audio-{request_id}.wav"
+        cache_path.write_bytes(audio_bytes)
+        logger.info("query request_id=%s saved audio to %s", request_id, cache_path)
 
     transcript = fake_transcribe(
         query_text=query_text,

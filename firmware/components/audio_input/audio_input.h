@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -55,3 +56,22 @@ esp_err_t audio_input_capture_i2s_wav(const audio_input_i2s_config_t *cfg,
                                       uint8_t *out_buf,
                                       size_t out_len,
                                       size_t *written_out);
+
+/*
+ * Press-and-hold recording API.
+ *
+ * audio_input_recording_start() initializes the codec/I2S channel, allocates
+ * a PCM buffer big enough for max_duration_ms, and spawns a background task
+ * that keeps reading samples until either the buffer fills or
+ * audio_input_recording_stop() is called.
+ *
+ * audio_input_recording_stop() signals the reader to finish, builds a WAV
+ * file in a freshly-allocated buffer, and hands ownership to the caller via
+ * *wav_out (caller must free()). Pass wav_out == NULL to discard the take.
+ */
+esp_err_t audio_input_recording_start(const audio_input_i2s_config_t *cfg,
+                                      uint32_t max_duration_ms);
+bool audio_input_recording_is_active(void);
+esp_err_t audio_input_recording_stop(uint8_t **wav_out,
+                                     size_t *wav_size_out,
+                                     uint32_t *duration_ms_out);

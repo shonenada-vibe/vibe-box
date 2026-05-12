@@ -13,6 +13,7 @@
 
 #include "audio_input.h"
 #include "ui_epaper.h"
+#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_check.h"
@@ -60,6 +61,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD 1
 #else
 #define VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY
+#define VIBE_BOX_ENABLE_DEMO_QUERY 1
+#else
+#define VIBE_BOX_ENABLE_DEMO_QUERY 0
 #endif
 
 #ifdef CONFIG_VIBE_BOX_API_TOKEN
@@ -164,6 +171,14 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_I2S_CHANNELS 1
 #endif
 
+/* Press-and-hold microphone trigger. PWR button on Waveshare V2 is GPIO 18,
+ * active-low with internal pull-up enabled. */
+#define VIBE_BOX_PWR_BUTTON_GPIO          18
+#define VIBE_BOX_RECORDING_MAX_MS         15000U
+#define VIBE_BOX_RECORDING_MIN_MS         300U
+#define VIBE_BOX_BUTTON_POLL_MS           20
+#define VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES  3
+
 static EventGroupHandle_t s_wifi_event_group;
 static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
@@ -221,6 +236,7 @@ typedef struct {
 static runtime_config_t s_runtime_config;
 static query_result_t s_last_query_result;
 static ui_snapshot_t s_ui_snapshot;
+static uint32_t s_press_start_ms;
 
 static const char *app_state_name(app_state_t state)
 {
@@ -298,7 +314,7 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  language=%s", cfg->language[0] ? cfg->language : "<empty>");
     ESP_LOGI(TAG, "  recording_duration_ms=%" PRIu32, cfg->recording_duration_ms);
     ESP_LOGI(TAG, "  health_poll_interval_ms=%d", CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
-    ESP_LOGI(TAG, "  demo_query_enabled=%d", CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY);
+    ESP_LOGI(TAG, "  demo_query_enabled=%d", VIBE_BOX_ENABLE_DEMO_QUERY);
     ESP_LOGI(TAG, "  demo_audio_upload_enabled=%d", VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD);
     ESP_LOGI(TAG, "  i2s_capture_enabled=%d", VIBE_BOX_ENABLE_I2S_CAPTURE);
     ESP_LOGI(TAG, "  demo_query_text=%s", CONFIG_VIBE_BOX_DEMO_QUERY_TEXT);
@@ -1318,6 +1334,59 @@ static esp_err_t build_i2s_audio_request_body(const runtime_config_t *cfg,
     return err;
 }
 
+/* Upload an already-captured WAV buffer to /v1/query and parse the response.
+ * The caller still owns wav_bytes (we only read it). */
+static esp_err_t upload_wav_and_parse(const runtime_config_t *cfg,
+                                      const uint8_t *wav_bytes,
+                                      size_t wav_size,
+                                      query_result_t *result)
+{
+    char content_type[128];
+    char *response_buf = NULL;
+    uint8_t *body = NULL;
+    size_t body_len = 0;
+    int status = 0;
+    esp_err_t err;
+
+    if (cfg == NULL || wav_bytes == NULL || wav_size == 0U || result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    response_buf = calloc(1, QUERY_RESPONSE_BUFFER_SIZE);
+    if (response_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = build_audio_upload_multipart_body(
+        cfg, wav_bytes, wav_size, &body, &body_len, content_type, sizeof(content_type));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to build wav upload body: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    err = perform_http_request(cfg,
+                               "/v1/query",
+                               HTTP_METHOD_POST,
+                               content_type,
+                               body,
+                               body_len,
+                               response_buf,
+                               QUERY_RESPONSE_BUFFER_SIZE,
+                               &status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wav upload request failed status=%d err=%s",
+                 status, esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    err = parse_query_response(response_buf, result);
+
+cleanup:
+    free(body);
+    free(response_buf);
+    return err;
+}
+
 static esp_err_t query_server_once(const runtime_config_t *cfg, query_result_t *result)
 {
     char encoded_device_id[128];
@@ -1619,7 +1688,7 @@ static void stop_provisioning_server(void)
 
 static TickType_t main_loop_delay_ticks(void)
 {
-    if (CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY) {
+    if (VIBE_BOX_ENABLE_DEMO_QUERY) {
         return pdMS_TO_TICKS(CONFIG_VIBE_BOX_QUERY_POLL_INTERVAL_MS);
     }
     return pdMS_TO_TICKS(CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
@@ -1821,6 +1890,159 @@ static void ui_dashboard_task(void *arg)
     }
 }
 
+static esp_err_t pwr_button_init(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << VIBE_BOX_PWR_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&cfg);
+}
+
+static void handle_press_and_hold_recording(void)
+{
+    if (audio_input_recording_is_active()) {
+        ESP_LOGW(TAG, "press detected while recording already active; ignoring");
+        return;
+    }
+
+    audio_input_i2s_config_t capture_cfg = {
+        .i2s_port = VIBE_BOX_I2S_PORT,
+        .i2c_port = VIBE_BOX_I2C_PORT,
+        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
+        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
+        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
+        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
+        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
+        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
+        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
+        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
+        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
+        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
+        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
+        .bits_per_sample = 16,
+        .duration_ms = 0,
+    };
+
+    esp_err_t err = audio_input_recording_start(&capture_cfg, VIBE_BOX_RECORDING_MAX_MS);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "audio_input_recording_start failed: %s", esp_err_to_name(err));
+        render_ui_status(APP_STATE_ERROR, "Recording", "mic init failed");
+        return;
+    }
+
+    s_press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    render_ui_status(APP_STATE_RECORDING, "Recording", "release to send");
+}
+
+static void handle_press_release_and_upload(void)
+{
+    if (!audio_input_recording_is_active()) {
+        return;
+    }
+
+    uint32_t pressed_ms = 0;
+    if (s_press_start_ms != 0U) {
+        pressed_ms = (uint32_t)(esp_timer_get_time() / 1000) - s_press_start_ms;
+        s_press_start_ms = 0;
+    }
+
+    uint8_t *wav_buf = NULL;
+    size_t wav_size = 0;
+    uint32_t duration_ms = 0;
+    esp_err_t err = audio_input_recording_stop(&wav_buf, &wav_size, &duration_ms);
+
+    if (err == ESP_ERR_INVALID_SIZE || (err == ESP_OK && wav_size == 0U)) {
+        render_ui_status(APP_STATE_IDLE, "Idle", "press too short");
+        ESP_LOGW(TAG, "press released after %" PRIu32 "ms with empty audio", pressed_ms);
+        free(wav_buf);
+        return;
+    }
+    if (err != ESP_OK) {
+        render_ui_status(APP_STATE_ERROR, "Recording", "stop failed");
+        ESP_LOGE(TAG, "audio_input_recording_stop failed: %s", esp_err_to_name(err));
+        free(wav_buf);
+        return;
+    }
+
+    if (duration_ms < VIBE_BOX_RECORDING_MIN_MS) {
+        ESP_LOGW(TAG, "discarding short take: %" PRIu32 "ms", duration_ms);
+        render_ui_status(APP_STATE_IDLE, "Idle", "press too short");
+        free(wav_buf);
+        return;
+    }
+
+    if (!wifi_is_connected()) {
+        render_ui_status(APP_STATE_ERROR, "Upload", "wifi disconnected");
+        free(wav_buf);
+        return;
+    }
+
+    char detail[64];
+    snprintf(detail, sizeof(detail), "uploading %" PRIu32 " ms", duration_ms);
+    render_ui_status(APP_STATE_UPLOADING, "Uploading", detail);
+
+    err = upload_wav_and_parse(&s_runtime_config, wav_buf, wav_size, &s_last_query_result);
+    free(wav_buf);
+
+    if (err == ESP_OK) {
+        log_query_result(&s_last_query_result);
+        render_ui_query_result(&s_last_query_result);
+        render_ui_status(APP_STATE_IDLE, "Idle", "ready for next take");
+    } else {
+        render_ui_status(APP_STATE_ERROR, "Upload", esp_err_to_name(err));
+    }
+}
+
+static void audio_button_task(void *arg)
+{
+    (void)arg;
+
+    if (pwr_button_init() != ESP_OK) {
+        ESP_LOGE(TAG, "failed to init PWR button GPIO%d", VIBE_BOX_PWR_BUTTON_GPIO);
+        vTaskDelete(NULL);
+        return;
+    }
+    ESP_LOGI(TAG, "press-and-hold trigger ready on GPIO%d (active low)",
+             VIBE_BOX_PWR_BUTTON_GPIO);
+
+    /* Simple debounced edge detector. The button reads 1 when released and 0
+     * when held down. We require BUTTON_DEBOUNCE_SAMPLES consecutive identical
+     * samples before accepting a transition. */
+    int stable_level = 1;
+    int candidate_level = 1;
+    int candidate_count = 0;
+
+    while (true) {
+        int level = gpio_get_level(VIBE_BOX_PWR_BUTTON_GPIO);
+        if (level == candidate_level) {
+            if (candidate_count < VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES) {
+                candidate_count++;
+            }
+        } else {
+            candidate_level = level;
+            candidate_count = 1;
+        }
+
+        if (candidate_count >= VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES &&
+            candidate_level != stable_level) {
+            stable_level = candidate_level;
+            if (stable_level == 0) {
+                ESP_LOGI(TAG, "PWR button pressed");
+                handle_press_and_hold_recording();
+            } else {
+                ESP_LOGI(TAG, "PWR button released");
+                handle_press_release_and_upload();
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(VIBE_BOX_BUTTON_POLL_MS));
+    }
+}
+
 void app_main(void)
 {
     app_state_t state = APP_STATE_BOOT;
@@ -1872,6 +2094,11 @@ void app_main(void)
     log_todo_modules();
     clear_query_result(&s_last_query_result);
 
+    if (xTaskCreatePinnedToCore(audio_button_task, "audio_btn", 6144, NULL, 5, NULL,
+                                tskNO_AFFINITY) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create audio_button_task");
+    }
+
     while (true) {
         if (state == APP_STATE_IDLE) {
             esp_err_t err;
@@ -1883,7 +2110,14 @@ void app_main(void)
                 continue;
             }
 
-            if (CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY) {
+            if (audio_input_recording_is_active()) {
+                /* The PWR-button task owns the codec/I2S channel right now; leave
+                 * the idle auto-poll out of its way until release+upload finishes. */
+                vTaskDelay(pdMS_TO_TICKS(200));
+                continue;
+            }
+
+            if (VIBE_BOX_ENABLE_DEMO_QUERY) {
                 if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
                     set_state(&state, APP_STATE_RECORDING, "capturing codec audio");
                     render_ui_status(state, "Recording", "capturing codec audio");

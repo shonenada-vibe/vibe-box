@@ -73,10 +73,12 @@ config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
 
 config VIBE_BOX_ENABLE_DEMO_QUERY
     bool "Enable demo /v1/query requests"
-    default y
+    default n
     help
-        When enabled, the device sends a demo text query to /v1/query instead of only
-        checking /health. This is useful before audio input is implemented.
+        When enabled, the idle loop periodically fires /v1/query (text or audio) on its
+        own. Leave this off when the PWR button press-and-hold flow is the intended
+        trigger; the auto-poll path opens its own I2S channel and will collide with the
+        button-driven recording.
 
 config VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD
     bool "Enable demo audio upload"
@@ -158,9 +160,10 @@ config VIBE_BOX_I2S_BCLK_GPIO
 config VIBE_BOX_I2S_WS_GPIO
     int "I2S WS GPIO"
     range -1 48
-    default 17
+    default 38
     help
-        Word select GPIO for I2S capture.
+        Word select GPIO for I2S capture. The Waveshare ESP32-S3-Touch-ePaper-1.54
+        V2 board routes the ES8311 LRCLK (WS) to GPIO 38; GPIO 17 is unconnected.
 
 config VIBE_BOX_I2S_DIN_GPIO
     int "I2S DIN GPIO"

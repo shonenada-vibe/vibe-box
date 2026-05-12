@@ -5,10 +5,13 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "driver/i2s_std.h"
 #include "driver/i2c_master.h"
 #include "driver/gpio.h"
 #include "esp_check.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 static const char *TAG = "audio_input";
@@ -114,57 +117,101 @@ static esp_err_t es8311_configure_clocks_16k(void)
 static esp_err_t es8311_init_registers(const audio_input_i2s_config_t *cfg)
 {
     uint8_t reg_value = 0;
+    (void)cfg;
 
+    /* Soft reset. */
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_RESET_REG00, 0x1F), TAG, "reset stage1 failed");
     vTaskDelay(pdMS_TO_TICKS(20));
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_RESET_REG00, 0x00), TAG, "reset stage2 failed");
 
-    ESP_RETURN_ON_ERROR(es8311_read_reg(ES8311_RESET_REG00, &reg_value), TAG, "read reg00 failed");
-    reg_value = (uint8_t)(reg_value & (uint8_t)~0x40U);
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_RESET_REG00, reg_value), TAG, "slave mode failed");
+    /* I2C noise-immunity double write (per esp_codec_dev es8311_open). */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GPIO_REG44, 0x08), TAG, "reg44 noise1 failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GPIO_REG44, 0x08), TAG, "reg44 noise2 failed");
 
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG01, 0x30), TAG, "reg01 failed");
-    ESP_RETURN_ON_ERROR(es8311_read_reg(ES8311_CLK_MANAGER_REG01, &reg_value), TAG, "read reg01 failed");
-    reg_value = (uint8_t)(reg_value & (uint8_t)~0x40U);
-    if (cfg->mclk_gpio >= 0) {
-        reg_value = (uint8_t)(reg_value & (uint8_t)~0x80U);
-    }
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG01, reg_value), TAG, "write reg01 failed");
-
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG06, 0x00), TAG, "reg06 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG07, 0x10), TAG, "reg07 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG08, 0x10), TAG, "reg08 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SDPIN_REG09, 0x3C), TAG, "reg09 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SDPOUT_REG0A, 0x3C), TAG, "reg0a init failed");
-
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0xFF), TAG, "reg0d init failed");
+    /* Provisional clock/registers — configure_clocks_16k() rewrites the
+     * dividers further down with the per-rate divider table values. */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG01, 0x30), TAG, "reg01 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG02, 0x00), TAG, "reg02 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG03, 0x10), TAG, "reg03 init failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG16, 0x24), TAG, "reg16 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG17, 0x00), TAG, "reg17 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG18, 0x88), TAG, "reg18 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG19, 0x02), TAG, "reg19 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG1A, 0x0A), TAG, "reg1a init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG1B, 0x7F), TAG, "reg1b init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG1C, 0x6A), TAG, "reg1c init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG37, 0x48), TAG, "reg37 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GPIO_REG44, 0x00), TAG, "reg44 init failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GP_REG45, 0x00), TAG, "reg45 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG04, 0x10), TAG, "reg04 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG05, 0x00), TAG, "reg05 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(0x0B, 0x00), TAG, "reg0b init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(0x0C, 0x00), TAG, "reg0c init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(0x10, 0x1F), TAG, "reg10 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(0x11, 0x7F), TAG, "reg11 init failed");
 
+    /* REG00 = 0x80 → CSM_ON = 1 (state machine running). Without this bit
+     * the codec stays halted and the ADC produces digital zero forever. */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_RESET_REG00, 0x80), TAG, "reg00 csm-on failed");
+    ESP_RETURN_ON_ERROR(es8311_read_reg(ES8311_RESET_REG00, &reg_value), TAG, "read reg00 failed");
+    reg_value = (uint8_t)(reg_value & 0xBFU);  /* slave mode: clear bit 6 (MS). */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_RESET_REG00, reg_value), TAG, "reg00 slave failed");
+
+    /* REG01 = 0x3F → use_mclk=1 (clear bit 7), invert_mclk=0 (clear bit 6),
+     * and turn on the SYS_CLK + ADC_OSC + ADC_DMIC_OSC + DAC_OSC gates that
+     * the previous 0x30 value left disabled. Missing ADC_OSC_EN was why the
+     * ADC modulator had no oversample clock and produced silence. */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG01, 0x3F), TAG, "reg01 mclk failed");
+
+    /* SCLK polarity: invert_sclk = false → clear bit 5 of REG06. */
+    ESP_RETURN_ON_ERROR(es8311_read_reg(ES8311_CLK_MANAGER_REG06, &reg_value), TAG, "read reg06 failed");
+    reg_value = (uint8_t)(reg_value & (uint8_t)~0x20U);
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_CLK_MANAGER_REG06, reg_value), TAG, "reg06 polarity failed");
+
+    /* Analog reference power-up and ADC anti-pop trim. */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(0x13, 0x10), TAG, "reg13 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG1B, 0x0A), TAG, "reg1b init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG1C, 0x6A), TAG, "reg1c init failed");
+
+    /* Internal reference routing for ADCL+DACR loopback default. */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GPIO_REG44, 0x58), TAG, "reg44 ref failed");
+
+    /* SDP word-length + format: 16-bit / I2S Normal. Matches the final state
+     * after canonical set_bits_per_sample(16) + config_fmt(I2S_NORMAL). */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SDPIN_REG09, 0x0C), TAG, "reg09 init failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SDPOUT_REG0A, 0x0C), TAG, "reg0a init failed");
+
+    /* Now apply the 16 kHz divider table values. */
     ESP_RETURN_ON_ERROR(es8311_configure_clocks_16k(), TAG, "clock config failed");
     return ESP_OK;
 }
 
 static esp_err_t es8311_start_adc(void)
 {
-    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SDPIN_REG09, 0x40, 0x00), TAG, "unmute adc failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0E, 0x02), TAG, "reg0e start failed");
-    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SYSTEM_REG12, 0x20, 0x00), TAG, "reg12 start failed");
-    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SYSTEM_REG14, 0x40, 0x00), TAG, "reg14 start failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0x00), TAG, "reg0d start failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG15, 0x00), TAG, "reg15 start failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG17, 0xBF), TAG, "reg17 start failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GP_REG45, 0x00), TAG, "reg45 start failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GPIO_REG44, 0x58), TAG, "reg44 start failed");
+    /* Mirrors esp_codec_dev es8311_start() for analog mic capture.
+     * Unmute the ADC (REG0A bit 6, not REG09 which is the DAC), then power
+     * up the analog ADC stages and route the analog mic into the PGA. */
+    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SDPOUT_REG0A, 0x40, 0x00), TAG, "unmute adc failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG17, 0xBF), TAG, "reg17 pga gain failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0E, 0x02), TAG, "reg0e analog pwr failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG12, 0x00), TAG, "reg12 pwr-up failed");
+    /* REG14 = 0x1A: select analog MIC1, enable PGA, bit 6 = 0 → AMIC (not DMIC). */
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG14, 0x1A), TAG, "reg14 mic select failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0x01), TAG, "reg0d digital pwr failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG15, 0x40), TAG, "reg15 adc cfg failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG37, 0x08), TAG, "reg37 failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GP_REG45, 0x00), TAG, "reg45 failed");
     return ESP_OK;
+}
+
+static void es8311_dump_registers(const char *label)
+{
+    static const uint8_t regs[] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        0x09, 0x0A, 0x0D, 0x0E, 0x12, 0x13, 0x14, 0x15,
+        0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
+        0x44, 0x45, 0xFD, 0xFE, 0xFF,
+    };
+    for (size_t i = 0; i < sizeof(regs); ++i) {
+        uint8_t v = 0xAA;
+        esp_err_t e = es8311_read_reg(regs[i], &v);
+        if (e == ESP_OK) {
+            ESP_LOGI(TAG, "es8311[%s] reg 0x%02x = 0x%02x", label, regs[i], v);
+        } else {
+            ESP_LOGW(TAG, "es8311[%s] reg 0x%02x read failed: %s", label, regs[i], esp_err_to_name(e));
+        }
+    }
 }
 
 static void write_le16(uint8_t *dst, uint16_t value)
@@ -369,7 +416,10 @@ esp_err_t audio_input_prepare_i2s_capture(const audio_input_i2s_config_t *cfg)
     }
 
     ESP_RETURN_ON_ERROR(es8311_init_registers(cfg), TAG, "es8311 init failed");
-    ESP_RETURN_ON_ERROR(es8311_start_adc(), TAG, "es8311 adc start failed");
+    es8311_dump_registers("post-init");
+    /* NOTE: don't call es8311_start_adc() here. The ADC needs a live MCLK to
+     * produce valid samples; MCLK only starts once the I2S channel is enabled.
+     * Callers start the ADC explicitly after i2s_channel_enable() succeeds. */
 
     s_codec_cfg = *cfg;
     s_codec_ready = true;
@@ -458,6 +508,11 @@ esp_err_t audio_input_capture_i2s_wav(const audio_input_i2s_config_t *cfg,
     ESP_GOTO_ON_ERROR(i2s_channel_init_std_mode(rx_handle, &std_cfg), cleanup, TAG, "init std rx");
     ESP_GOTO_ON_ERROR(i2s_channel_enable(rx_handle), cleanup, TAG, "enable rx");
 
+    /* MCLK is live now — let it stabilize, then start the codec ADC. */
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_GOTO_ON_ERROR(es8311_start_adc(), cleanup, TAG, "es8311 adc start failed");
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     ESP_LOGI(TAG,
              "starting i2s capture port=%d rate=%" PRIu32 " channels=%u duration_ms=%" PRIu32
              " bclk=%d ws=%d din=%d mclk=%d",
@@ -496,4 +551,268 @@ cleanup:
         i2s_del_channel(rx_handle);
     }
     return ret;
+}
+
+/* ------------------------------------------------------------------ */
+/* Streaming press-and-hold recording                                 */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+    audio_input_i2s_config_t cfg;
+    i2s_chan_handle_t rx_handle;
+    uint8_t *pcm_buf;        /* allocated in PSRAM when available */
+    size_t capacity;          /* bytes */
+    size_t captured;          /* bytes */
+    volatile bool stop_requested;
+    SemaphoreHandle_t done_sem;
+} audio_recording_ctx_t;
+
+static audio_recording_ctx_t *s_rec_ctx;
+
+static void audio_recording_task(void *arg)
+{
+    audio_recording_ctx_t *ctx = (audio_recording_ctx_t *)arg;
+
+    ESP_LOGI(TAG, "recording task started capacity=%u bytes", (unsigned)ctx->capacity);
+    /* Read a bounded chunk per iteration so we stay responsive to stop_requested.
+     * 4 KB at 16 kHz / mono / 16-bit is ~128 ms of audio. */
+    const size_t chunk_bytes = 4096U;
+    while (!ctx->stop_requested && ctx->captured < ctx->capacity) {
+        size_t to_read = ctx->capacity - ctx->captured;
+        if (to_read > chunk_bytes) {
+            to_read = chunk_bytes;
+        }
+        size_t bytes_read = 0;
+        esp_err_t ret = i2s_channel_read(ctx->rx_handle,
+                                         ctx->pcm_buf + ctx->captured,
+                                         to_read,
+                                         &bytes_read,
+                                         pdMS_TO_TICKS(500));
+        /* On timeout the driver still reports the partial bytes it managed to
+         * deliver — count them, don't discard them. */
+        if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
+            ctx->captured += bytes_read;
+        } else {
+            ESP_LOGE(TAG, "recording read failed: %s", esp_err_to_name(ret));
+            break;
+        }
+    }
+    if (ctx->captured >= ctx->capacity) {
+        ESP_LOGW(TAG, "recording hit max-duration cap (%u bytes)", (unsigned)ctx->capacity);
+    }
+    xSemaphoreGive(ctx->done_sem);
+    vTaskDelete(NULL);
+}
+
+esp_err_t audio_input_recording_start(const audio_input_i2s_config_t *cfg,
+                                      uint32_t max_duration_ms)
+{
+    if (cfg == NULL || max_duration_ms == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg->bits_per_sample != 16U || (cfg->channels != 1U && cfg->channels != 2U)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg->bclk_gpio < 0 || cfg->ws_gpio < 0 || cfg->din_gpio < 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (s_rec_ctx != NULL) {
+        ESP_LOGW(TAG, "recording_start called while already recording");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_RETURN_ON_ERROR(audio_input_prepare_i2s_capture(cfg), TAG, "prepare codec failed");
+
+    size_t capacity = audio_input_pcm_size(
+        cfg->sample_rate_hz, cfg->channels, cfg->bits_per_sample, max_duration_ms);
+    if (capacity == 0U) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    audio_recording_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (ctx == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ctx->pcm_buf = heap_caps_malloc(capacity, MALLOC_CAP_SPIRAM);
+    if (ctx->pcm_buf == NULL) {
+        ctx->pcm_buf = heap_caps_malloc(capacity, MALLOC_CAP_8BIT);
+    }
+    if (ctx->pcm_buf == NULL) {
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
+    ctx->cfg = *cfg;
+    ctx->capacity = capacity;
+    ctx->done_sem = xSemaphoreCreateBinary();
+    if (ctx->done_sem == NULL) {
+        free(ctx->pcm_buf);
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)cfg->i2s_port,
+                                                            I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    esp_err_t err = i2s_new_channel(&chan_cfg, NULL, &ctx->rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_new_channel failed: %s", esp_err_to_name(err));
+        goto fail;
+    }
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg->sample_rate_hz),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+            I2S_DATA_BIT_WIDTH_16BIT,
+            cfg->channels == 1U ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = cfg->mclk_gpio,
+            .bclk = cfg->bclk_gpio,
+            .ws = cfg->ws_gpio,
+            .dout = I2S_GPIO_UNUSED,
+            .din = cfg->din_gpio,
+            .invert_flags = {0},
+        },
+    };
+    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+
+    err = i2s_channel_init_std_mode(ctx->rx_handle, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s", esp_err_to_name(err));
+        goto fail;
+    }
+    err = i2s_channel_enable(ctx->rx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_enable failed: %s", esp_err_to_name(err));
+        goto fail;
+    }
+
+    /* MCLK is live now — let it stabilize, then start the codec ADC. */
+    vTaskDelay(pdMS_TO_TICKS(20));
+    err = es8311_start_adc();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "es8311_start_adc failed: %s", esp_err_to_name(err));
+        i2s_channel_disable(ctx->rx_handle);
+        goto fail;
+    }
+    /* Discard the first ~50 ms of audio; the ADC anti-pop ramp produces a
+     * thump otherwise. The reader task will drop the leading DMA buffer. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+    es8311_dump_registers("post-adc");
+
+    BaseType_t task_ok = xTaskCreate(
+        audio_recording_task, "audio_rec", 4096, ctx, 6, NULL);
+    if (task_ok != pdPASS) {
+        err = ESP_ERR_NO_MEM;
+        goto fail;
+    }
+
+    s_rec_ctx = ctx;
+    ESP_LOGI(TAG,
+             "recording started max_ms=%" PRIu32 " capacity=%u bytes",
+             max_duration_ms,
+             (unsigned)capacity);
+    return ESP_OK;
+
+fail:
+    if (ctx->rx_handle != NULL) {
+        i2s_channel_disable(ctx->rx_handle);
+        i2s_del_channel(ctx->rx_handle);
+    }
+    if (ctx->done_sem != NULL) {
+        vSemaphoreDelete(ctx->done_sem);
+    }
+    free(ctx->pcm_buf);
+    free(ctx);
+    return err;
+}
+
+bool audio_input_recording_is_active(void)
+{
+    return s_rec_ctx != NULL;
+}
+
+esp_err_t audio_input_recording_stop(uint8_t **wav_out,
+                                     size_t *wav_size_out,
+                                     uint32_t *duration_ms_out)
+{
+    audio_recording_ctx_t *ctx = s_rec_ctx;
+
+    if (ctx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ctx->stop_requested = true;
+    /* Worst case the read in flight has a 100ms timeout. Wait up to 2s. */
+    if (xSemaphoreTake(ctx->done_sem, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ESP_LOGW(TAG, "recording task did not finish in 2s; cleaning up anyway");
+    }
+
+    i2s_channel_disable(ctx->rx_handle);
+    i2s_del_channel(ctx->rx_handle);
+    vSemaphoreDelete(ctx->done_sem);
+    s_rec_ctx = NULL;
+
+    size_t pcm_size = ctx->captured;
+    uint32_t duration_ms = 0;
+    if (ctx->cfg.sample_rate_hz != 0U && ctx->cfg.channels != 0U) {
+        uint64_t bytes_per_second =
+            (uint64_t)ctx->cfg.sample_rate_hz * ctx->cfg.channels *
+            (ctx->cfg.bits_per_sample / 8U);
+        if (bytes_per_second > 0U) {
+            duration_ms = (uint32_t)(((uint64_t)pcm_size * 1000ULL) / bytes_per_second);
+        }
+    }
+    if (duration_ms_out != NULL) {
+        *duration_ms_out = duration_ms;
+    }
+
+    ESP_LOGI(TAG,
+             "recording stopped pcm_bytes=%u duration_ms=%" PRIu32,
+             (unsigned)pcm_size,
+             duration_ms);
+
+    esp_err_t result = ESP_OK;
+
+    if (wav_out == NULL || wav_size_out == NULL) {
+        /* Caller wants to discard the take. */
+        free(ctx->pcm_buf);
+        free(ctx);
+        return ESP_OK;
+    }
+
+    if (pcm_size == 0U) {
+        free(ctx->pcm_buf);
+        free(ctx);
+        *wav_out = NULL;
+        *wav_size_out = 0;
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    size_t wav_size = 44U + pcm_size;
+    uint8_t *wav_buf = heap_caps_malloc(wav_size, MALLOC_CAP_SPIRAM);
+    if (wav_buf == NULL) {
+        wav_buf = malloc(wav_size);
+    }
+    if (wav_buf == NULL) {
+        result = ESP_ERR_NO_MEM;
+    } else {
+        result = write_wav_header(wav_buf,
+                                  wav_size,
+                                  ctx->cfg.sample_rate_hz,
+                                  ctx->cfg.channels,
+                                  ctx->cfg.bits_per_sample,
+                                  pcm_size);
+        if (result == ESP_OK) {
+            memcpy(wav_buf + 44U, ctx->pcm_buf, pcm_size);
+            *wav_out = wav_buf;
+            *wav_size_out = wav_size;
+        } else {
+            free(wav_buf);
+        }
+    }
+
+    free(ctx->pcm_buf);
+    free(ctx);
+    return result;
 }
