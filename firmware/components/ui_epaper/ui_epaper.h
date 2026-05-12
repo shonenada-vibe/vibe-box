@@ -13,6 +13,7 @@ extern "C" {
 
 #define UI_EPAPER_WIDTH       200
 #define UI_EPAPER_HEIGHT      200
+#define UI_EPAPER_FRAME_BUFFER_BYTES ((UI_EPAPER_WIDTH / 8) * UI_EPAPER_HEIGHT)
 
 /* Maximum lines that show_lines() will render. */
 #define UI_EPAPER_MAX_LINES   16
@@ -43,6 +44,15 @@ void ui_epaper_draw_hline(int y, int x0, int x1);
 
 /* Push the current buffer to the panel using a partial refresh. */
 esp_err_t ui_epaper_flush(void);
+
+/*
+ * Replace the whole in-RAM frame buffer with a packed 1bpp image and push it.
+ * The bitmap format matches the panel buffer layout exactly:
+ * - row-major, top-to-bottom
+ * - 1 bit per pixel, MSB is the leftmost pixel in each byte
+ * - bit value 1 = white, 0 = black
+ */
+esp_err_t ui_epaper_show_bitmap(const uint8_t *bitmap, size_t bitmap_len);
 
 /*
  * High-level helper: render a status page made of a headline and a detail

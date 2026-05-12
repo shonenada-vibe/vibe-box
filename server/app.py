@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
+from display_bitmap import render_display_bitmap_hex
 from schemas import QueryResponse
 from provider_adapter import fake_transcribe
 from response_shaper import build_display_lines, build_reply_text
@@ -99,12 +100,14 @@ async def query(
         temperature=temperature,
         humidity=humidity,
     )
+    display_bitmap_hex = render_display_bitmap_hex(display_lines or [reply_text])
 
     logger.info(
-        "query response request_id=%s transcript=%r display_lines=%s",
+        "query response request_id=%s transcript=%r display_lines=%s bitmap=%s",
         request_id,
         transcript,
         display_lines,
+        "yes" if display_bitmap_hex else "no",
     )
 
     return QueryResponse(
@@ -112,6 +115,7 @@ async def query(
         transcript=transcript,
         reply_text=reply_text,
         display_lines=display_lines,
+        display_bitmap_hex=display_bitmap_hex,
         speak_text=build_speak_text(reply_text),
         refresh_mode="partial",
         cache_ttl_s=60,

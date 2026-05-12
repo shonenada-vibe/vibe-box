@@ -257,6 +257,24 @@ static esp_err_t write_wav_header(uint8_t *dst,
     return ESP_OK;
 }
 
+static i2s_std_slot_config_t build_i2s_rx_slot_config(const audio_input_i2s_config_t *cfg)
+{
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_16BIT,
+        cfg->channels == 1U ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO);
+
+    if (cfg->channels == 1U) {
+        /* On ESP32-S3 standard-mode RX the helper macro defaults mono capture
+         * to BOTH slots. That yields interleaved L/R words even for a single
+         * mic, so a mono WAV header makes playback sound half-speed. */
+        slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    } else {
+        slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
+    }
+
+    return slot_cfg;
+}
+
 size_t audio_input_pcm_size(uint32_t sample_rate_hz,
                             uint16_t channels,
                             uint16_t bits_per_sample,
@@ -486,9 +504,7 @@ esp_err_t audio_input_capture_i2s_wav(const audio_input_i2s_config_t *cfg,
 
     std_cfg = (i2s_std_config_t){
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg->sample_rate_hz),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-            I2S_DATA_BIT_WIDTH_16BIT,
-            cfg->channels == 1U ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
+        .slot_cfg = build_i2s_rx_slot_config(cfg),
         .gpio_cfg = {
             .mclk = cfg->mclk_gpio,
             .bclk = cfg->bclk_gpio,
@@ -662,9 +678,7 @@ esp_err_t audio_input_recording_start(const audio_input_i2s_config_t *cfg,
 
     i2s_std_config_t std_cfg = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(cfg->sample_rate_hz),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-            I2S_DATA_BIT_WIDTH_16BIT,
-            cfg->channels == 1U ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
+        .slot_cfg = build_i2s_rx_slot_config(cfg),
         .gpio_cfg = {
             .mclk = cfg->mclk_gpio,
             .bclk = cfg->bclk_gpio,

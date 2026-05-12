@@ -37,7 +37,7 @@ static const char *TAG = "ui_epaper";
 #define VBAT_PWR_PIN  GPIO_NUM_17
 
 #define EPD_SPI_HOST  SPI2_HOST
-#define EPD_BUF_LEN   ((UI_EPAPER_WIDTH / 8) * UI_EPAPER_HEIGHT) /* 25 * 200 = 5000 */
+#define EPD_BUF_LEN   UI_EPAPER_FRAME_BUFFER_BYTES /* 25 * 200 = 5000 */
 /* Poll period must round up to at least one FreeRTOS tick or vTaskDelay()
  * returns immediately and the timeout becomes meaningless. We measure real
  * wall-clock elapsed time via esp_timer_get_time() instead of summing the
@@ -500,6 +500,19 @@ esp_err_t ui_epaper_flush(void)
     epd_send_data_buf(s_frame_buffer, EPD_BUF_LEN);
     epd_turn_on_partial();
     return ESP_OK;
+}
+
+esp_err_t ui_epaper_show_bitmap(const uint8_t *bitmap, size_t bitmap_len)
+{
+    if (!s_initialized) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (bitmap == NULL || bitmap_len != EPD_BUF_LEN || s_frame_buffer == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memcpy(s_frame_buffer, bitmap, EPD_BUF_LEN);
+    return ui_epaper_flush();
 }
 
 /* ------------------------------------------------------------------ */

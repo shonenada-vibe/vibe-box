@@ -39,6 +39,7 @@
 - 如果传了 `audio` 且配置了 `WHISPER_API_URL`，会转发到 Whisper-compatible STT
 - 如果传了 `audio` 但没配置 STT 环境变量，会返回占位 transcript
 - 再生成适合 200x200 墨水屏显示的 `display_lines`
+- 在 macOS 本地开发环境下，会额外尝试把结果渲染成 `200x200` 的 1-bit 点阵并返回 `display_bitmap_hex`
 
 ## 可选环境变量
 
@@ -60,3 +61,14 @@
 - `response_shaper.py`
 - `tts_proxy.py`
 - `schemas.py`
+
+## 中文显示说明
+
+当前设备端自带的是最小 `ASCII` 字库，所以中文不适合直接在固件里逐字渲染。
+
+现在的联调方案是：
+
+- server 继续返回 `display_lines`
+- server 同时尝试把这些行渲染成整屏 `1bpp` 点阵
+- 设备端如果收到 `display_bitmap_hex`，就直接把这张位图刷到 e-paper
+- 如果服务端本机没有可用的 `Swift/AppKit` 环境，则会自动退回纯文本字段，不影响接口可用性

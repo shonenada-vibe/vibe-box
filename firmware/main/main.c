@@ -35,7 +35,7 @@ static const char *TAG = "vibe_box";
 #define WIFI_FAIL_BIT      BIT1
 
 #define HEALTH_RESPONSE_BUFFER_SIZE     256
-#define QUERY_RESPONSE_BUFFER_SIZE      2048
+#define QUERY_RESPONSE_BUFFER_SIZE      16384
 #define FORM_BODY_BUFFER_SIZE           1024
 #define URL_BUFFER_SIZE                 320
 #define QUERY_DISPLAY_LINE_MAX          4
@@ -43,6 +43,7 @@ static const char *TAG = "vibe_box";
 #define QUERY_TEXT_MAX                  256
 #define QUERY_REPLY_MAX                 512
 #define QUERY_REQUEST_ID_MAX            64
+#define QUERY_DISPLAY_BITMAP_BYTES      UI_EPAPER_FRAME_BUFFER_BYTES
 #define MULTIPART_BOUNDARY              "----VibeBoxBoundary7MA4YWxkTrZu0gW"
 #define RUNTIME_WIFI_SSID_MAX           33
 #define RUNTIME_WIFI_PASSWORD_MAX       65
@@ -171,9 +172,10 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_I2S_CHANNELS 1
 #endif
 
-/* Press-and-hold microphone trigger. PWR button on Waveshare V2 is GPIO 18,
- * active-low with internal pull-up enabled. */
-#define VIBE_BOX_PWR_BUTTON_GPIO          18
+/* Press-and-hold microphone trigger. Use the BOOT button on ESP32-S3,
+ * which is typically wired to GPIO 0 and reads active-low with the
+ * internal pull-up enabled. */
+#define VIBE_BOX_RECORD_BUTTON_GPIO       0
 #define VIBE_BOX_RECORDING_MAX_MS         15000U
 #define VIBE_BOX_RECORDING_MIN_MS         300U
 #define VIBE_BOX_BUTTON_POLL_MS           20
@@ -216,6 +218,8 @@ typedef struct {
     char reply_text[QUERY_REPLY_MAX];
     char display_lines[QUERY_DISPLAY_LINE_MAX][QUERY_DISPLAY_COL_MAX];
     size_t display_line_count;
+    bool has_display_bitmap;
+    uint8_t display_bitmap[QUERY_DISPLAY_BITMAP_BYTES];
 } query_result_t;
 
 typedef struct {
@@ -237,6 +241,7 @@ static runtime_config_t s_runtime_config;
 static query_result_t s_last_query_result;
 static ui_snapshot_t s_ui_snapshot;
 static uint32_t s_press_start_ms;
+static TaskHandle_t s_ui_dashboard_task_handle;
 
 static const char *app_state_name(app_state_t state)
 {
@@ -1013,7 +1018,9 @@ static void render_ui_status(app_state_t state, const char *headline, const char
              s_ui_snapshot.headline,
              s_ui_snapshot.detail);
 
-    /* The e-paper is refreshed by ui_dashboard_task every few seconds. */
+    if (s_ui_dashboard_task_handle != NULL) {
+        xTaskNotifyGive(s_ui_dashboard_task_handle);
+    }
 }
 
 static void render_ui_query_result(const query_result_t *result)
@@ -1033,7 +1040,68 @@ static void render_ui_query_result(const query_result_t *result)
 
     ESP_LOGI(TAG, "ui result detail=%s", s_ui_snapshot.detail);
 
-    /* The e-paper is refreshed by ui_dashboard_task every few seconds. */
+    if (s_ui_dashboard_task_handle != NULL) {
+        xTaskNotifyGive(s_ui_dashboard_task_handle);
+    }
+}
+
+static int hex_nibble_value(char ch)
+{
+    if (ch >= '0' && ch <= '9') {
+        return ch - '0';
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        return 10 + (ch - 'a');
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        return 10 + (ch - 'A');
+    }
+    return -1;
+}
+
+static bool decode_hex_bitmap(const char *src, uint8_t *dst, size_t dst_len)
+{
+    size_t src_len;
+
+    if (src == NULL || dst == NULL) {
+        return false;
+    }
+
+    src_len = strlen(src);
+    if (src_len != dst_len * 2U) {
+        return false;
+    }
+
+    for (size_t i = 0; i < dst_len; ++i) {
+        int hi = hex_nibble_value(src[i * 2U]);
+        int lo = hex_nibble_value(src[(i * 2U) + 1U]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        dst[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    return true;
+}
+
+static void flip_bitmap_vertically_inplace(uint8_t *bitmap, size_t bitmap_len)
+{
+    uint8_t rotated[QUERY_DISPLAY_BITMAP_BYTES];
+    const size_t row_bytes = UI_EPAPER_WIDTH / 8U;
+
+    if (bitmap == NULL || bitmap_len != sizeof(rotated)) {
+        return;
+    }
+
+    for (size_t y = 0; y < UI_EPAPER_HEIGHT; ++y) {
+        for (size_t xb = 0; xb < row_bytes; ++xb) {
+            size_t dst_index = (y * row_bytes) + xb;
+            size_t src_index = ((UI_EPAPER_HEIGHT - 1U - y) * row_bytes) + xb;
+            rotated[dst_index] = bitmap[src_index];
+        }
+    }
+
+    memcpy(bitmap, rotated, sizeof(rotated));
 }
 
 static void copy_json_string(cJSON *parent, const char *key, char *dst, size_t dst_size)
@@ -1054,6 +1122,7 @@ static esp_err_t parse_query_response(const char *response_body, query_result_t 
 {
     cJSON *root;
     cJSON *display_lines;
+    cJSON *display_bitmap_hex;
     cJSON *line;
     size_t line_index = 0;
 
@@ -1085,6 +1154,19 @@ static esp_err_t parse_query_response(const char *response_body, query_result_t 
         }
     }
 
+    display_bitmap_hex = cJSON_GetObjectItemCaseSensitive(root, "display_bitmap_hex");
+    if (cJSON_IsString(display_bitmap_hex) && display_bitmap_hex->valuestring != NULL &&
+        display_bitmap_hex->valuestring[0] != '\0') {
+        if (decode_hex_bitmap(display_bitmap_hex->valuestring,
+                              result->display_bitmap,
+                              sizeof(result->display_bitmap))) {
+            flip_bitmap_vertically_inplace(result->display_bitmap, sizeof(result->display_bitmap));
+            result->has_display_bitmap = true;
+        } else {
+            ESP_LOGW(TAG, "query display_bitmap_hex invalid; falling back to ASCII text");
+        }
+    }
+
     result->display_line_count = line_index;
     cJSON_Delete(root);
 
@@ -1103,6 +1185,10 @@ static void log_query_result(const query_result_t *result)
     ESP_LOGI(TAG, "query result request_id=%s", result->request_id);
     ESP_LOGI(TAG, "query transcript=%s", result->transcript);
     ESP_LOGI(TAG, "query reply_text=%s", result->reply_text);
+    ESP_LOGI(TAG,
+             "query display_bitmap=%s (%u bytes)",
+             result->has_display_bitmap ? "yes" : "no",
+             (unsigned)sizeof(result->display_bitmap));
     for (i = 0; i < result->display_line_count; ++i) {
         ESP_LOGI(TAG, "query display_line[%u]=%s", (unsigned)i, result->display_lines[i]);
     }
@@ -1765,6 +1851,19 @@ static void ui_dashboard_render_once(void)
         return;
     }
 
+    if ((s_ui_snapshot.page_state == APP_STATE_IDLE ||
+         s_ui_snapshot.page_state == APP_STATE_DISPLAYING) &&
+        s_last_query_result.has_display_bitmap) {
+        esp_err_t err = ui_epaper_show_bitmap(s_last_query_result.display_bitmap,
+                                              sizeof(s_last_query_result.display_bitmap));
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "epaper bitmap flush failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGD(TAG, "epaper bitmap refreshed");
+        }
+        return;
+    }
+
     ui_epaper_clear();
 
     char line[UI_EPAPER_MAX_COLS + 1];
@@ -1883,17 +1982,17 @@ static void ui_dashboard_task(void *arg)
 {
     (void)arg;
     const TickType_t period = pdMS_TO_TICKS(UI_DASHBOARD_REFRESH_MS);
-    TickType_t last_wake = xTaskGetTickCount();
+    s_ui_dashboard_task_handle = xTaskGetCurrentTaskHandle();
     while (true) {
         ui_dashboard_render_once();
-        vTaskDelayUntil(&last_wake, period);
+        (void)ulTaskNotifyTake(pdTRUE, period);
     }
 }
 
-static esp_err_t pwr_button_init(void)
+static esp_err_t record_button_init(void)
 {
     gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << VIBE_BOX_PWR_BUTTON_GPIO,
+        .pin_bit_mask = 1ULL << VIBE_BOX_RECORD_BUTTON_GPIO,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -2001,13 +2100,13 @@ static void audio_button_task(void *arg)
 {
     (void)arg;
 
-    if (pwr_button_init() != ESP_OK) {
-        ESP_LOGE(TAG, "failed to init PWR button GPIO%d", VIBE_BOX_PWR_BUTTON_GPIO);
+    if (record_button_init() != ESP_OK) {
+        ESP_LOGE(TAG, "failed to init BOOT button GPIO%d", VIBE_BOX_RECORD_BUTTON_GPIO);
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "press-and-hold trigger ready on GPIO%d (active low)",
-             VIBE_BOX_PWR_BUTTON_GPIO);
+    ESP_LOGI(TAG, "press-and-hold trigger ready on BOOT/GPIO%d (active low)",
+             VIBE_BOX_RECORD_BUTTON_GPIO);
 
     /* Simple debounced edge detector. The button reads 1 when released and 0
      * when held down. We require BUTTON_DEBOUNCE_SAMPLES consecutive identical
@@ -2017,7 +2116,7 @@ static void audio_button_task(void *arg)
     int candidate_count = 0;
 
     while (true) {
-        int level = gpio_get_level(VIBE_BOX_PWR_BUTTON_GPIO);
+        int level = gpio_get_level(VIBE_BOX_RECORD_BUTTON_GPIO);
         if (level == candidate_level) {
             if (candidate_count < VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES) {
                 candidate_count++;
@@ -2031,10 +2130,10 @@ static void audio_button_task(void *arg)
             candidate_level != stable_level) {
             stable_level = candidate_level;
             if (stable_level == 0) {
-                ESP_LOGI(TAG, "PWR button pressed");
+                ESP_LOGI(TAG, "BOOT button pressed");
                 handle_press_and_hold_recording();
             } else {
-                ESP_LOGI(TAG, "PWR button released");
+                ESP_LOGI(TAG, "BOOT button released");
                 handle_press_release_and_upload();
             }
         }
@@ -2111,7 +2210,7 @@ void app_main(void)
             }
 
             if (audio_input_recording_is_active()) {
-                /* The PWR-button task owns the codec/I2S channel right now; leave
+                /* The BOOT-button task owns the codec/I2S channel right now; leave
                  * the idle auto-poll out of its way until release+upload finishes. */
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;

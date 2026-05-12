@@ -8,6 +8,7 @@ class QueryResponse(BaseModel):
     transcript: str
     reply_text: str
     display_lines: list[str] = Field(default_factory=list)
+    display_bitmap_hex: str = ""
     speak_text: str = ""
     refresh_mode: str = "partial"
     cache_ttl_s: int = 60
