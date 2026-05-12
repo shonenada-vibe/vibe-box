@@ -89,32 +89,19 @@ def _whisper_compatible_transcribe(
     return _extract_text(payload)
 
 
-def fake_transcribe(
-    query_text: str | None = None,
-    filename: str | None = None,
-    audio_bytes: bytes | None = None,
-    audio_size: int | None = None,
+def transcribe_audio(
+    *,
+    filename: str,
+    audio_bytes: bytes,
     language: str = "zh",
 ) -> str:
-    cleaned_query = (query_text or "").strip()
-    if cleaned_query:
-        return cleaned_query
+    if not filename:
+        raise RuntimeError("audio filename is missing")
+    if not audio_bytes:
+        raise RuntimeError("audio payload is empty")
 
-    if filename and audio_bytes:
-        try:
-            return _whisper_compatible_transcribe(
-                audio_bytes=audio_bytes,
-                filename=filename,
-                language=language,
-            )
-        except RuntimeError as exc:
-            if os.environ.get("VIBE_BOX_STRICT_STT", "").strip().lower() in {"1", "true", "yes"}:
-                raise
-            size_suffix = f" ({audio_size} bytes)" if audio_size is not None else ""
-            return f"stt fallback after error: {exc}; file={filename}{size_suffix}"
-
-    if filename:
-        size_suffix = f" ({audio_size} bytes)" if audio_size is not None else ""
-        return f"received audio file: {filename}{size_suffix}"
-
-    return "received request without audio file"
+    return _whisper_compatible_transcribe(
+        audio_bytes=audio_bytes,
+        filename=filename,
+        language=language,
+    )

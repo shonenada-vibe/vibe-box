@@ -61,8 +61,7 @@ config VIBE_BOX_RECORDING_DURATION_MS
     range 1000 15000
     default 3000
     help
-        Target recording duration for future real audio capture. Demo audio uploads also
-        use this value unless a dedicated demo duration is configured.
+        Target recording duration for microphone capture and upload.
 
 config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
     int "Health poll interval (ms)"
@@ -71,28 +70,12 @@ config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
     help
         Interval used to call GET /health after Wi-Fi is connected.
 
-config VIBE_BOX_ENABLE_DEMO_QUERY
-    bool "Enable demo /v1/query requests"
-    default n
-    help
-        When enabled, the idle loop periodically fires /v1/query (text or audio) on its
-        own. Leave this off when the PWR button press-and-hold flow is the intended
-        trigger; the auto-poll path opens its own I2S channel and will collide with the
-        button-driven recording.
-
-config VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD
-    bool "Enable demo audio upload"
-    default n
-    help
-        When enabled together with demo query mode, the device builds a synthetic WAV
-        sample and uploads it as multipart/form-data instead of sending query_text only.
-
 config VIBE_BOX_ENABLE_I2S_CAPTURE
     bool "Enable I2S RX audio capture"
     default y
     help
         When enabled, the device captures real audio from an I2S RX data line and uploads
-        that WAV payload from the board codec instead of a synthetic demo tone.
+        that WAV payload from the board codec.
 
 config VIBE_BOX_I2C_PORT
     int "Audio codec I2C port"
@@ -185,46 +168,6 @@ config VIBE_BOX_I2S_CHANNELS
     default 1
     help
         Channel count used for captured PCM data.
-
-config VIBE_BOX_DEMO_QUERY_TEXT
-    string "Demo query text"
-    default "你好，Vibe Box"
-    help
-        Text sent as query_text when demo query mode is enabled.
-
-config VIBE_BOX_DEMO_AUDIO_DURATION_MS
-    int "Demo audio duration (ms)"
-    range 250 10000
-    default 2000
-    help
-        Synthetic audio duration used for multipart upload testing before real microphone
-        capture is implemented.
-
-config VIBE_BOX_DEMO_AUDIO_TONE_HZ
-    int "Demo audio tone frequency (Hz)"
-    range 100 4000
-    default 660
-    help
-        Test tone frequency used to generate the WAV payload.
-
-config VIBE_BOX_DEMO_TEMPERATURE
-    string "Demo temperature"
-    default ""
-    help
-        Optional temperature value sent to the thin server before sensor integration exists.
-
-config VIBE_BOX_DEMO_HUMIDITY
-    string "Demo humidity"
-    default ""
-    help
-        Optional humidity value sent to the thin server before sensor integration exists.
-
-config VIBE_BOX_QUERY_POLL_INTERVAL_MS
-    int "Demo query poll interval (ms)"
-    range 1000 600000
-    default 30000
-    help
-        Interval used to call POST /v1/query in demo mode.
 
 config VIBE_BOX_WIFI_MAXIMUM_RETRY
     int "Wi-Fi maximum retry count"

@@ -8,37 +8,15 @@ def _fit_line(text: str, width: int = 18) -> str:
     return stripped[:width]
 
 
-def build_reply_text(
-    transcript: str,
-    *,
-    device_id: str = "",
-    temperature: str = "",
-    humidity: str = "",
-) -> str:
+def build_reply_text(transcript: str) -> str:
     if transcript:
-        status = []
-        if temperature:
-            status.append(f"T={temperature}")
-        if humidity:
-            status.append(f"H={humidity}")
-        suffix = f" [{' '.join(status)}]" if status else ""
-        return f"{transcript}{suffix}"
-    return "Server mock processed an empty transcript."
+        return transcript
+    return ""
 
-
-def build_display_lines(
-    transcript: str,
-    reply_text: str,
-    *,
-    temperature: str = "",
-    humidity: str = "",
-) -> list[str]:
+def build_display_lines(transcript: str, reply_text: str) -> list[str]:
     lines = [
         _fit_line(transcript) or "no transcript",
-        # _fit_line(reply_text) or "no reply",
+        _fit_line(reply_text) or "no reply",
     ]
-
-    if temperature or humidity:
-        lines.append(_fit_line(f"T:{temperature or '-'} H:{humidity or '-'}"))
 
     return [line for line in lines if line][:4]

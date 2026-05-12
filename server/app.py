@@ -9,7 +9,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 
 from display_bitmap import render_display_bitmap_hex
 from schemas import QueryResponse
-from provider_adapter import fake_transcribe
+from provider_adapter import transcribe_audio
 from response_shaper import build_display_lines, build_reply_text
 from tts_proxy import build_speak_text
 
@@ -45,21 +45,17 @@ async def query(
     device_id: str = Form(default="unknown-device"),
     firmware_version: str = Form(default="dev"),
     session_id: str = Form(default=""),
-    temperature: str = Form(default=""),
-    humidity: str = Form(default=""),
-    battery_level: str = Form(default=""),
     language: str = Form(default="zh"),
     recording_duration_ms: int = Form(default=0),
-    query_text: str = Form(default=""),
     audio_format: str = Form(default="wav"),
-    audio: UploadFile | None = File(default=None),
+    audio: UploadFile = File(...),
     authorization: str | None = Header(default=None),
 ) -> QueryResponse:
     _check_auth(authorization)
 
-    audio_bytes = b""
-    if audio is not None:
-        audio_bytes = await audio.read()
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="audio file is empty")
 
     request_id = str(uuid4())
     logger.info(
@@ -75,31 +71,22 @@ async def query(
         "present" if authorization else "missing",
     )
 
-    if audio_bytes:
-        AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        cache_path = AUDIO_CACHE_DIR / f"audio-{request_id}.wav"
-        cache_path.write_bytes(audio_bytes)
-        logger.info("query request_id=%s saved audio to %s", request_id, cache_path)
+    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = AUDIO_CACHE_DIR / f"audio-{request_id}.wav"
+    cache_path.write_bytes(audio_bytes)
+    logger.info("query request_id=%s saved audio to %s", request_id, cache_path)
 
-    transcript = fake_transcribe(
-        query_text=query_text,
-        filename=audio.filename if audio else None,
-        audio_bytes=audio_bytes if audio else None,
-        audio_size=len(audio_bytes) if audio else None,
-        language=language,
-    )
-    reply_text = build_reply_text(
-        transcript,
-        device_id=device_id,
-        temperature=temperature,
-        humidity=humidity,
-    )
-    display_lines = build_display_lines(
-        transcript,
-        reply_text,
-        temperature=temperature,
-        humidity=humidity,
-    )
+    try:
+        transcript = transcribe_audio(
+            filename=audio.filename or "recording.wav",
+            audio_bytes=audio_bytes,
+            language=language,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    reply_text = build_reply_text(transcript)
+    display_lines = build_display_lines(transcript, reply_text)
     display_bitmap_hex = render_display_bitmap_hex(display_lines or [reply_text])
 
     logger.info(

@@ -7,23 +7,6 @@
 #include "esp_err.h"
 
 typedef struct {
-    uint32_t sample_rate_hz;
-    uint16_t channels;
-    uint16_t bits_per_sample;
-    uint32_t duration_ms;
-    float tone_frequency_hz;
-    int16_t amplitude;
-} audio_input_demo_config_t;
-
-size_t audio_input_demo_pcm_size(const audio_input_demo_config_t *cfg);
-size_t audio_input_demo_wav_size(const audio_input_demo_config_t *cfg);
-
-esp_err_t audio_input_generate_demo_wav(const audio_input_demo_config_t *cfg,
-                                        uint8_t *out_buf,
-                                        size_t out_len,
-                                        size_t *written_out);
-
-typedef struct {
     int i2s_port;
     int i2c_port;
     int i2c_sda_gpio;
@@ -51,11 +34,6 @@ size_t audio_input_wav_size(uint32_t sample_rate_hz,
                             uint32_t duration_ms);
 
 esp_err_t audio_input_prepare_i2s_capture(const audio_input_i2s_config_t *cfg);
-
-esp_err_t audio_input_capture_i2s_wav(const audio_input_i2s_config_t *cfg,
-                                      uint8_t *out_buf,
-                                      size_t out_len,
-                                      size_t *written_out);
 
 /*
  * Press-and-hold recording API.

@@ -29,8 +29,6 @@
 
 static const char *TAG = "vibe_box";
 
-#define URL_ENCODE_ERROR ((size_t)-1)
-
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
@@ -57,18 +55,6 @@ static const char *TAG = "vibe_box";
 #define PROVISIONING_STATUS_BUFFER_SIZE 1024
 #define WIFI_CONNECT_TIMEOUT_MS         30000
 #define NVS_NAMESPACE                   "vibe_box"
-
-#ifdef CONFIG_VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD
-#define VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD 1
-#else
-#define VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD 0
-#endif
-
-#ifdef CONFIG_VIBE_BOX_ENABLE_DEMO_QUERY
-#define VIBE_BOX_ENABLE_DEMO_QUERY 1
-#else
-#define VIBE_BOX_ENABLE_DEMO_QUERY 0
-#endif
 
 #ifdef CONFIG_VIBE_BOX_API_TOKEN
 #define VIBE_BOX_DEFAULT_API_TOKEN CONFIG_VIBE_BOX_API_TOKEN
@@ -319,12 +305,7 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  language=%s", cfg->language[0] ? cfg->language : "<empty>");
     ESP_LOGI(TAG, "  recording_duration_ms=%" PRIu32, cfg->recording_duration_ms);
     ESP_LOGI(TAG, "  health_poll_interval_ms=%d", CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
-    ESP_LOGI(TAG, "  demo_query_enabled=%d", VIBE_BOX_ENABLE_DEMO_QUERY);
-    ESP_LOGI(TAG, "  demo_audio_upload_enabled=%d", VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD);
     ESP_LOGI(TAG, "  i2s_capture_enabled=%d", VIBE_BOX_ENABLE_I2S_CAPTURE);
-    ESP_LOGI(TAG, "  demo_query_text=%s", CONFIG_VIBE_BOX_DEMO_QUERY_TEXT);
-    ESP_LOGI(TAG, "  demo_audio_duration_ms=%d", CONFIG_VIBE_BOX_DEMO_AUDIO_DURATION_MS);
-    ESP_LOGI(TAG, "  demo_audio_tone_hz=%d", CONFIG_VIBE_BOX_DEMO_AUDIO_TONE_HZ);
     ESP_LOGI(TAG, "  i2c_port=%d", VIBE_BOX_I2C_PORT);
     ESP_LOGI(TAG, "  i2c_sda_gpio=%d", VIBE_BOX_I2C_SDA_GPIO);
     ESP_LOGI(TAG, "  i2c_scl_gpio=%d", VIBE_BOX_I2C_SCL_GPIO);
@@ -338,9 +319,6 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  i2s_din_gpio=%d", VIBE_BOX_I2S_DIN_GPIO);
     ESP_LOGI(TAG, "  i2s_sample_rate_hz=%d", VIBE_BOX_I2S_SAMPLE_RATE_HZ);
     ESP_LOGI(TAG, "  i2s_channels=%d", VIBE_BOX_I2S_CHANNELS);
-    ESP_LOGI(TAG, "  demo_temperature=%s", CONFIG_VIBE_BOX_DEMO_TEMPERATURE);
-    ESP_LOGI(TAG, "  demo_humidity=%s", CONFIG_VIBE_BOX_DEMO_HUMIDITY);
-    ESP_LOGI(TAG, "  query_poll_interval_ms=%d", CONFIG_VIBE_BOX_QUERY_POLL_INTERVAL_MS);
     ESP_LOGI(TAG, "  wifi_maximum_retry=%d", CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY);
     ESP_LOGI(TAG, "  provisioning_ap_ssid=%s", CONFIG_VIBE_BOX_PROVISIONING_AP_SSID);
 }
@@ -743,11 +721,6 @@ static esp_err_t wifi_start_provisioning_ap(void)
     return ESP_OK;
 }
 
-static char hex_digit(unsigned value)
-{
-    return (value < 10U) ? (char)('0' + value) : (char)('A' + (value - 10U));
-}
-
 static int hex_value(char ch)
 {
     if (ch >= '0' && ch <= '9') {
@@ -760,42 +733,6 @@ static int hex_value(char ch)
         return 10 + (ch - 'a');
     }
     return -1;
-}
-
-static bool is_unreserved_uri_char(unsigned char ch)
-{
-    return isalnum((int)ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~';
-}
-
-static size_t url_encode_component(const char *src, char *dst, size_t dst_len)
-{
-    size_t out = 0;
-
-    if (dst_len == 0U) {
-        return URL_ENCODE_ERROR;
-    }
-
-    while (*src != '\0') {
-        unsigned char ch = (unsigned char)*src++;
-
-        if (is_unreserved_uri_char(ch)) {
-            if ((out + 1U) >= dst_len) {
-                return URL_ENCODE_ERROR;
-            }
-            dst[out++] = (char)ch;
-            continue;
-        }
-
-        if ((out + 3U) >= dst_len) {
-            return URL_ENCODE_ERROR;
-        }
-        dst[out++] = '%';
-        dst[out++] = hex_digit((unsigned)(ch >> 4));
-        dst[out++] = hex_digit((unsigned)(ch & 0x0F));
-    }
-
-    dst[out] = '\0';
-    return out;
 }
 
 static bool url_decode_component(const char *src, size_t src_len, char *dst, size_t dst_len)
@@ -1241,7 +1178,7 @@ static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
 {
     static const char file_header_template[] =
         "--" MULTIPART_BOUNDARY "\r\n"
-        "Content-Disposition: form-data; name=\"audio\"; filename=\"demo.wav\"\r\n"
+        "Content-Disposition: form-data; name=\"audio\"; filename=\"recording.wav\"\r\n"
         "Content-Type: audio/wav\r\n\r\n";
     static const char closing_template[] = "\r\n--" MULTIPART_BOUNDARY "--\r\n";
     size_t capacity;
@@ -1260,11 +1197,9 @@ static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
 
     offset = append_form_field(body, capacity, offset, "device_id", cfg->device_id);
     offset = append_form_field(body, capacity, offset, "firmware_version", cfg->firmware_version);
-    offset = append_form_field(body, capacity, offset, "session_id", "demo-session");
+    offset = append_form_field(body, capacity, offset, "session_id", "button-recording");
     offset = append_form_field(body, capacity, offset, "language", cfg->language);
     offset = append_form_field(body, capacity, offset, "audio_format", "wav");
-    offset = append_form_field(body, capacity, offset, "temperature", CONFIG_VIBE_BOX_DEMO_TEMPERATURE);
-    offset = append_form_field(body, capacity, offset, "humidity", CONFIG_VIBE_BOX_DEMO_HUMIDITY);
     {
         char rec_ms[16];
 
@@ -1302,122 +1237,6 @@ static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
     *body_out = body;
     *body_len_out = offset;
     return ESP_OK;
-}
-
-static esp_err_t build_demo_audio_request_body(const runtime_config_t *cfg,
-                                               uint8_t **body_out,
-                                               size_t *body_len_out,
-                                               char *content_type,
-                                               size_t content_type_len)
-{
-    audio_input_demo_config_t audio_cfg = {
-        .sample_rate_hz = 16000,
-        .channels = 1,
-        .bits_per_sample = 16,
-        .duration_ms = CONFIG_VIBE_BOX_DEMO_AUDIO_DURATION_MS,
-        .tone_frequency_hz = (float)CONFIG_VIBE_BOX_DEMO_AUDIO_TONE_HZ,
-        .amplitude = 8000,
-    };
-    size_t wav_size = audio_input_demo_wav_size(&audio_cfg);
-    uint8_t *wav_buf;
-    size_t wav_written = 0;
-    esp_err_t err;
-
-    if (wav_size == 0U) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    wav_buf = malloc(wav_size);
-    if (wav_buf == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    err = audio_input_generate_demo_wav(&audio_cfg, wav_buf, wav_size, &wav_written);
-    if (err == ESP_OK) {
-        err = build_audio_upload_multipart_body(
-            cfg, wav_buf, wav_written, body_out, body_len_out, content_type, content_type_len);
-    }
-    free(wav_buf);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG,
-                 "built demo audio multipart body wav_bytes=%u total_bytes=%u duration_ms=%d tone_hz=%d",
-                 (unsigned)wav_written,
-                 (unsigned)*body_len_out,
-                 CONFIG_VIBE_BOX_DEMO_AUDIO_DURATION_MS,
-                 CONFIG_VIBE_BOX_DEMO_AUDIO_TONE_HZ);
-    }
-    return err;
-}
-
-static esp_err_t build_i2s_audio_request_body(const runtime_config_t *cfg,
-                                              uint8_t **body_out,
-                                              size_t *body_len_out,
-                                              char *content_type,
-                                              size_t content_type_len)
-{
-    audio_input_i2s_config_t capture_cfg = {
-        .i2s_port = VIBE_BOX_I2S_PORT,
-        .i2c_port = VIBE_BOX_I2C_PORT,
-        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
-        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
-        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
-        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
-        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
-        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
-        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
-        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
-        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
-        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
-        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
-        .bits_per_sample = 16,
-        .duration_ms = cfg->recording_duration_ms,
-    };
-    size_t wav_size = audio_input_wav_size(capture_cfg.sample_rate_hz,
-                                           capture_cfg.channels,
-                                           capture_cfg.bits_per_sample,
-                                           capture_cfg.duration_ms);
-    uint8_t *wav_buf;
-    size_t wav_written = 0;
-    esp_err_t err;
-
-    if (capture_cfg.i2c_sda_gpio < 0 || capture_cfg.i2c_scl_gpio < 0 || capture_cfg.mclk_gpio < 0 ||
-        capture_cfg.bclk_gpio < 0 || capture_cfg.ws_gpio < 0 || capture_cfg.din_gpio < 0) {
-        ESP_LOGW(TAG,
-                 "codec capture requested but pins are not configured i2c_sda=%d i2c_scl=%d mclk=%d bclk=%d ws=%d din=%d",
-                 capture_cfg.i2c_sda_gpio,
-                 capture_cfg.i2c_scl_gpio,
-                 capture_cfg.mclk_gpio,
-                 capture_cfg.bclk_gpio,
-                 capture_cfg.ws_gpio,
-                 capture_cfg.din_gpio);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    if (wav_size == 0U) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    wav_buf = malloc(wav_size);
-    if (wav_buf == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    err = audio_input_capture_i2s_wav(&capture_cfg, wav_buf, wav_size, &wav_written);
-    if (err == ESP_OK) {
-        err = build_audio_upload_multipart_body(
-            cfg, wav_buf, wav_written, body_out, body_len_out, content_type, content_type_len);
-    }
-    free(wav_buf);
-
-    if (err == ESP_OK) {
-        ESP_LOGI(TAG,
-                 "built i2s audio multipart body wav_bytes=%u total_bytes=%u duration_ms=%" PRIu32,
-                 (unsigned)wav_written,
-                 (unsigned)*body_len_out,
-                 cfg->recording_duration_ms);
-    }
-    return err;
 }
 
 /* Upload an already-captured WAV buffer to /v1/query and parse the response.
@@ -1469,116 +1288,6 @@ static esp_err_t upload_wav_and_parse(const runtime_config_t *cfg,
 
 cleanup:
     free(body);
-    free(response_buf);
-    return err;
-}
-
-static esp_err_t query_server_once(const runtime_config_t *cfg, query_result_t *result)
-{
-    char encoded_device_id[128];
-    char encoded_firmware_version[128];
-    char encoded_language[64];
-    char encoded_temperature[64];
-    char encoded_humidity[64];
-    char content_type[128];
-    char *response_buf = NULL;
-    char *encoded_query_text = NULL;
-    char *form_body = NULL;
-    uint8_t *request_body = NULL;
-    size_t request_body_len = 0;
-    int status = 0;
-    esp_err_t err;
-
-    response_buf = calloc(1, QUERY_RESPONSE_BUFFER_SIZE);
-    if (response_buf == NULL) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
-        err = build_i2s_audio_request_body(
-            cfg, &request_body, &request_body_len, content_type, sizeof(content_type));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "failed to build i2s audio request: %s", esp_err_to_name(err));
-            goto cleanup;
-        }
-    } else if (VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD) {
-        err = build_demo_audio_request_body(
-            cfg, &request_body, &request_body_len, content_type, sizeof(content_type));
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "failed to build demo audio request: %s", esp_err_to_name(err));
-            goto cleanup;
-        }
-    } else {
-        encoded_query_text = malloc(FORM_BODY_BUFFER_SIZE);
-        form_body = malloc(FORM_BODY_BUFFER_SIZE);
-        if (encoded_query_text == NULL || form_body == NULL) {
-            err = ESP_ERR_NO_MEM;
-            goto cleanup;
-        }
-
-        if (url_encode_component(cfg->device_id, encoded_device_id, sizeof(encoded_device_id)) ==
-                URL_ENCODE_ERROR ||
-            url_encode_component(cfg->firmware_version,
-                                 encoded_firmware_version,
-                                 sizeof(encoded_firmware_version)) == URL_ENCODE_ERROR ||
-            url_encode_component(cfg->language, encoded_language, sizeof(encoded_language)) ==
-                URL_ENCODE_ERROR ||
-            url_encode_component(CONFIG_VIBE_BOX_DEMO_TEMPERATURE,
-                                 encoded_temperature,
-                                 sizeof(encoded_temperature)) == URL_ENCODE_ERROR ||
-            url_encode_component(CONFIG_VIBE_BOX_DEMO_HUMIDITY,
-                                 encoded_humidity,
-                                 sizeof(encoded_humidity)) == URL_ENCODE_ERROR ||
-            url_encode_component(CONFIG_VIBE_BOX_DEMO_QUERY_TEXT,
-                                 encoded_query_text,
-                                 FORM_BODY_BUFFER_SIZE) == URL_ENCODE_ERROR) {
-            ESP_LOGE(TAG, "failed to URL-encode form fields");
-            err = ESP_ERR_INVALID_SIZE;
-            goto cleanup;
-        }
-
-        if (snprintf(form_body,
-                     FORM_BODY_BUFFER_SIZE,
-                     "device_id=%s&firmware_version=%s&session_id=demo-session&language=%s&audio_format=text&temperature=%s&humidity=%s&recording_duration_ms=%" PRIu32 "&query_text=%s",
-                     encoded_device_id,
-                     encoded_firmware_version,
-                     encoded_language,
-                     encoded_temperature,
-                     encoded_humidity,
-                     cfg->recording_duration_ms,
-                     encoded_query_text) >= FORM_BODY_BUFFER_SIZE) {
-            ESP_LOGE(TAG, "query form body too large");
-            err = ESP_ERR_INVALID_SIZE;
-            goto cleanup;
-        }
-        strlcpy(content_type, "application/x-www-form-urlencoded", sizeof(content_type));
-        request_body = (uint8_t *)form_body;
-        request_body_len = strlen(form_body);
-    }
-
-    err = perform_http_request(cfg,
-                               "/v1/query",
-                               HTTP_METHOD_POST,
-                               content_type,
-                               request_body,
-                               request_body_len,
-                               response_buf,
-                               QUERY_RESPONSE_BUFFER_SIZE,
-                               &status);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "query request failed status=%d err=%s", status, esp_err_to_name(err));
-        goto cleanup;
-    }
-
-    err = parse_query_response(response_buf, result);
-
-cleanup:
-    if ((VIBE_BOX_ENABLE_I2S_CAPTURE || VIBE_BOX_ENABLE_DEMO_AUDIO_UPLOAD) &&
-        request_body != NULL) {
-        free(request_body);
-    }
-    free(form_body);
-    free(encoded_query_text);
     free(response_buf);
     return err;
 }
@@ -1774,9 +1483,6 @@ static void stop_provisioning_server(void)
 
 static TickType_t main_loop_delay_ticks(void)
 {
-    if (VIBE_BOX_ENABLE_DEMO_QUERY) {
-        return pdMS_TO_TICKS(CONFIG_VIBE_BOX_QUERY_POLL_INTERVAL_MS);
-    }
     return pdMS_TO_TICKS(CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
 }
 
@@ -2216,38 +1922,15 @@ void app_main(void)
                 continue;
             }
 
-            if (VIBE_BOX_ENABLE_DEMO_QUERY) {
-                if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
-                    set_state(&state, APP_STATE_RECORDING, "capturing codec audio");
-                    render_ui_status(state, "Recording", "capturing codec audio");
-                }
-                set_state(&state, APP_STATE_UPLOADING, "starting /v1/query");
-                render_ui_status(state,
-                                 "Uploading",
-                                 VIBE_BOX_ENABLE_I2S_CAPTURE ? "uploading recorded audio"
-                                                             : "sending demo query");
-                err = query_server_once(&s_runtime_config, &s_last_query_result);
-                if (err == ESP_OK) {
-                    set_state(&state, APP_STATE_DISPLAYING, "query response stored");
-                    log_query_result(&s_last_query_result);
-                    render_ui_query_result(&s_last_query_result);
-                    set_state(&state, APP_STATE_IDLE, "ready for next demo query");
-                    render_ui_status(state, "Idle", "waiting for next query");
-                } else {
-                    set_state(&state, APP_STATE_ERROR, "/v1/query failed");
-                    render_ui_status(state, "Error", "query failed");
-                }
+            set_state(&state, APP_STATE_UPLOADING, "starting /health probe");
+            render_ui_status(state, "Uploading", "checking /health");
+            err = health_check_once(&s_runtime_config);
+            if (err == ESP_OK) {
+                set_state(&state, APP_STATE_IDLE, "/health probe succeeded");
+                render_ui_status(state, "Idle", "health ok");
             } else {
-                set_state(&state, APP_STATE_UPLOADING, "starting /health probe");
-                render_ui_status(state, "Uploading", "checking /health");
-                err = health_check_once(&s_runtime_config);
-                if (err == ESP_OK) {
-                    set_state(&state, APP_STATE_IDLE, "/health probe succeeded");
-                    render_ui_status(state, "Idle", "health ok");
-                } else {
-                    set_state(&state, APP_STATE_ERROR, "/health probe failed");
-                    render_ui_status(state, "Error", "health failed");
-                }
+                set_state(&state, APP_STATE_ERROR, "/health probe failed");
+                render_ui_status(state, "Error", "health failed");
             }
         } else if (state == APP_STATE_PROVISIONING) {
             ESP_LOGI(TAG,

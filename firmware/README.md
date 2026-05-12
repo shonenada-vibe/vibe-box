@@ -41,18 +41,10 @@ firmware/
   - `Firmware version`
   - `Language`
   - `Recording duration`
-  - `Enable demo /v1/query requests`
-  - `Enable demo audio upload`
   - `Enable I2S RX audio capture`
   - `I2S port / MCLK / BCLK / WS / DIN`
   - `I2S sample rate / channels`
-  - `Demo query text`
-  - `Demo audio duration`
-  - `Demo audio tone frequency`
-  - `Demo temperature`
-  - `Demo humidity`
   - `Health poll interval`
-  - `Demo query poll interval`
 - 启动时会优先从 `NVS` 读取运行时配置：
   - `wifi_ssid`
   - `wifi_password`
@@ -68,10 +60,8 @@ firmware/
   - 提交表单后写入 `NVS` 并自动切回 `STA`
 - 若已有完整配置，启动后会：
   - 连接 Wi-Fi
-  - 在 demo 模式下周期性请求 `POST {server_base_url}/v1/query`
-  - 若启用 `Enable I2S RX audio capture`，会先录制一段真实 `I2S` 音频，再上传 `WAV`
-  - 若启用 `Enable demo audio upload`，会生成一段本地 `WAV` 测试音频并用 `multipart/form-data` 上传
-  - 非 demo 模式下周期性请求 `GET {server_base_url}/health`
+  - 周期性请求 `GET {server_base_url}/health`
+  - 用户按住 `BOOT` 键录音，松手后上传真实 `WAV`
   - 用日志打印状态、请求内容、响应内容和解析结果
 
 ## 真实音频采集
