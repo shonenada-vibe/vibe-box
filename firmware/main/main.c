@@ -243,6 +243,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_TOUCH_TAP_MAX_MS 300
 #endif
 
+#ifdef CONFIG_VIBE_BOX_TOUCH_HOLD_START_MS
+#define VIBE_BOX_TOUCH_HOLD_START_MS CONFIG_VIBE_BOX_TOUCH_HOLD_START_MS
+#else
+#define VIBE_BOX_TOUCH_HOLD_START_MS 180
+#endif
+
 /* Press-and-hold microphone trigger. Use the BOOT button on ESP32-S3,
  * which is typically wired to GPIO 0 and reads active-low with the
  * internal pull-up enabled. */
@@ -251,6 +257,7 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_RECORDING_MIN_MS         300U
 #define VIBE_BOX_BUTTON_POLL_MS           20
 #define VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES  3
+#define VIBE_BOX_TOUCH_POST_ENTER_IGNORE_MS 250U
 #define BLE_HID_KEY_ENTER                 0x28U
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -313,13 +320,22 @@ typedef struct {
     bool truncated;
 } http_response_context_t;
 
+typedef enum {
+    RECORD_OWNER_NONE = 0,
+    RECORD_OWNER_BOOT,
+    RECORD_OWNER_TOUCH,
+} record_owner_t;
+
 static runtime_config_t s_runtime_config;
 static query_result_t s_last_query_result;
 static ui_snapshot_t s_ui_snapshot;
 static uint32_t s_press_start_ms;
 static uint32_t s_touch_press_start_ms;
 static uint32_t s_touch_last_tap_release_ms;
+static uint32_t s_touch_ignore_until_ms;
+static volatile record_owner_t s_record_owner;
 static volatile bool s_touch_recording_started;
+static bool s_touch_ignoring_current_press;
 static TaskHandle_t s_ui_dashboard_task_handle;
 
 static const char *app_state_name(app_state_t state)
@@ -2060,10 +2076,33 @@ static void confirm_power_on_long_press(void)
     ESP_LOGI(TAG, "PWR long-press confirmed; powering on");
 }
 
-static bool handle_press_and_hold_recording(void)
+static const char *record_owner_name(record_owner_t owner)
 {
+    switch (owner) {
+    case RECORD_OWNER_BOOT:
+        return "BOOT";
+    case RECORD_OWNER_TOUCH:
+        return "TOUCH";
+    case RECORD_OWNER_NONE:
+    default:
+        return "none";
+    }
+}
+
+static bool handle_press_and_hold_recording(record_owner_t owner)
+{
+    if (s_record_owner != RECORD_OWNER_NONE) {
+        ESP_LOGW(TAG,
+                 "%s press detected while %s recording/upload is active; ignoring",
+                 record_owner_name(owner),
+                 record_owner_name(s_record_owner));
+        return false;
+    }
+
     if (audio_input_recording_is_active()) {
-        ESP_LOGW(TAG, "press detected while recording already active; ignoring");
+        ESP_LOGW(TAG,
+                 "%s press detected while recording already active without owner; ignoring",
+                 record_owner_name(owner));
         return false;
     }
 
@@ -2093,14 +2132,27 @@ static bool handle_press_and_hold_recording(void)
     }
 
     s_press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    s_record_owner = owner;
     render_ui_status(APP_STATE_RECORDING, "Recording", "release to send");
     return true;
 }
 
-static void handle_press_release_and_upload(void)
+static void handle_press_release_and_upload(record_owner_t owner)
 {
     if (!audio_input_recording_is_active()) {
         return;
+    }
+    if (s_record_owner != owner && s_record_owner != RECORD_OWNER_NONE) {
+        ESP_LOGW(TAG,
+                 "%s release ignored; active recording owner is %s",
+                 record_owner_name(owner),
+                 record_owner_name(s_record_owner));
+        return;
+    }
+    if (s_record_owner == RECORD_OWNER_NONE) {
+        ESP_LOGW(TAG,
+                 "%s release is stopping orphaned active recording",
+                 record_owner_name(owner));
     }
 
     uint32_t pressed_ms = 0;
@@ -2115,12 +2167,14 @@ static void handle_press_release_and_upload(void)
     esp_err_t err = audio_input_recording_stop(&wav_buf, &wav_size, &duration_ms);
 
     if (err == ESP_ERR_INVALID_SIZE || (err == ESP_OK && wav_size == 0U)) {
+        s_record_owner = RECORD_OWNER_NONE;
         render_ui_status(APP_STATE_IDLE, "Idle", "press too short");
         ESP_LOGW(TAG, "press released after %" PRIu32 "ms with empty audio", pressed_ms);
         free(wav_buf);
         return;
     }
     if (err != ESP_OK) {
+        s_record_owner = RECORD_OWNER_NONE;
         render_ui_status(APP_STATE_ERROR, "Recording", "stop failed");
         ESP_LOGE(TAG, "audio_input_recording_stop failed: %s", esp_err_to_name(err));
         free(wav_buf);
@@ -2128,6 +2182,7 @@ static void handle_press_release_and_upload(void)
     }
 
     if (duration_ms < VIBE_BOX_RECORDING_MIN_MS) {
+        s_record_owner = RECORD_OWNER_NONE;
         ESP_LOGW(TAG, "discarding short take: %" PRIu32 "ms", duration_ms);
         render_ui_status(APP_STATE_IDLE, "Idle", "press too short");
         free(wav_buf);
@@ -2135,6 +2190,7 @@ static void handle_press_release_and_upload(void)
     }
 
     if (!wifi_is_connected()) {
+        s_record_owner = RECORD_OWNER_NONE;
         render_ui_status(APP_STATE_ERROR, "Upload", "wifi disconnected");
         free(wav_buf);
         return;
@@ -2165,6 +2221,7 @@ static void handle_press_release_and_upload(void)
     } else {
         render_ui_status(APP_STATE_ERROR, "Upload", esp_err_to_name(err));
     }
+    s_record_owner = RECORD_OWNER_NONE;
 }
 
 static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
@@ -2177,6 +2234,7 @@ static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
     if (s_touch_last_tap_release_ms != 0U &&
         release_ms - s_touch_last_tap_release_ms <= (uint32_t)VIBE_BOX_TOUCH_DOUBLE_TAP_MS) {
         s_touch_last_tap_release_ms = 0;
+        s_touch_ignore_until_ms = release_ms + VIBE_BOX_TOUCH_POST_ENTER_IGNORE_MS;
         ESP_LOGI(TAG, "touch double tap detected; sending Enter key");
 
         esp_err_t err = ble_keyboard_send_key(0, BLE_HID_KEY_ENTER);
@@ -2196,11 +2254,12 @@ static void touch_hold_recording_task(void *arg)
 {
     uint32_t press_start_ms = (uint32_t)(uintptr_t)arg;
 
-    vTaskDelay(pdMS_TO_TICKS(VIBE_BOX_TOUCH_TAP_MAX_MS + VIBE_BOX_TOUCH_POLL_MS));
+    vTaskDelay(pdMS_TO_TICKS(VIBE_BOX_TOUCH_HOLD_START_MS));
 
-    if (s_touch_press_start_ms == press_start_ms && touch_input_is_pressed()) {
+    if (s_touch_press_start_ms == press_start_ms && touch_input_is_pressed() &&
+        s_record_owner == RECORD_OWNER_NONE) {
         ESP_LOGI(TAG, "touch hold detected; starting recording");
-        s_touch_recording_started = handle_press_and_hold_recording();
+        s_touch_recording_started = handle_press_and_hold_recording(RECORD_OWNER_TOUCH);
     }
 
     vTaskDelete(NULL);
@@ -2210,8 +2269,19 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
 {
     (void)user_ctx;
     if (event == TOUCH_EVENT_DOWN) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_touch_ignore_until_ms != 0U &&
+            (int32_t)(now_ms - s_touch_ignore_until_ms) < 0) {
+            ESP_LOGI(TAG, "touch down ignored after double tap");
+            s_touch_press_start_ms = 0;
+            s_touch_recording_started = false;
+            s_touch_ignoring_current_press = true;
+            return;
+        }
+        s_touch_ignore_until_ms = 0;
+        s_touch_ignoring_current_press = false;
         ESP_LOGI(TAG, "touch down");
-        s_touch_press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_touch_press_start_ms = now_ms;
         s_touch_recording_started = false;
         BaseType_t ok = xTaskCreatePinnedToCore(
             touch_hold_recording_task,
@@ -2225,6 +2295,11 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
             ESP_LOGE(TAG, "failed to create touch hold task");
         }
     } else {
+        if (s_touch_ignoring_current_press) {
+            ESP_LOGI(TAG, "touch up ignored after double tap");
+            s_touch_ignoring_current_press = false;
+            return;
+        }
         ESP_LOGI(TAG, "touch up");
         uint32_t release_ms = (uint32_t)(esp_timer_get_time() / 1000);
         uint32_t held_ms = s_touch_press_start_ms != 0U
@@ -2235,7 +2310,7 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         s_touch_recording_started = false;
         if (touch_recording_started) {
             s_touch_last_tap_release_ms = 0;
-            handle_press_release_and_upload();
+            handle_press_release_and_upload(RECORD_OWNER_TOUCH);
         } else {
             handle_touch_tap_enter(release_ms, held_ms);
         }
@@ -2277,10 +2352,10 @@ static void audio_button_task(void *arg)
             stable_level = candidate_level;
             if (stable_level == 0) {
                 ESP_LOGI(TAG, "BOOT button pressed");
-                handle_press_and_hold_recording();
+                handle_press_and_hold_recording(RECORD_OWNER_BOOT);
             } else {
                 ESP_LOGI(TAG, "BOOT button released");
-                handle_press_release_and_upload();
+                handle_press_release_and_upload(RECORD_OWNER_BOOT);
             }
         }
 
