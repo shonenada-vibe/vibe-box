@@ -19,6 +19,9 @@ void ble_keyboard_set_config_callbacks(ble_keyboard_config_get_cb_t get_cb,
 esp_err_t ble_keyboard_init(void);
 esp_err_t ble_keyboard_reinitialize(void);
 bool ble_keyboard_is_connected(void);
+bool ble_keyboard_text_client_connected(void);
+bool ble_keyboard_text_notify_enabled(void);
+bool ble_keyboard_config_notify_enabled(void);
 esp_err_t ble_keyboard_send_key(uint8_t modifier, uint8_t keycode);
 esp_err_t ble_keyboard_notify_text(const char *text);
 

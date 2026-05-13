@@ -257,6 +257,33 @@ config VIBE_BOX_TOUCH_POLL_MS
     help
         Period at which the touch driver polls the FingerNum register.
 
+config VIBE_BOX_TOUCH_DOUBLE_TAP_MS
+    int "Touch double-tap window (ms)"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range 150 1500
+    default 500
+    help
+        Maximum interval between two short touch releases to send an Enter key
+        over BLE HID.
+
+config VIBE_BOX_TOUCH_TAP_MAX_MS
+    int "Touch tap maximum duration (ms)"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range 50 1000
+    default 300
+    help
+        Maximum duration for a touch press/release to count as a tap for the
+        touch double-tap Enter gesture.
+
+config VIBE_BOX_TOUCH_HOLD_START_MS
+    int "Touch hold recording start delay (ms)"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range 80 1000
+    default 180
+    help
+        Continuous touch duration required before the touch gesture starts
+        recording. Lower values make touch recording feel more responsive.
+
 config VIBE_BOX_WIFI_MAXIMUM_RETRY
     int "Wi-Fi maximum retry count"
     range 1 20

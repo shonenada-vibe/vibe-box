@@ -592,6 +592,21 @@ bool ble_keyboard_is_connected(void)
     return s_hid_dev != NULL && esp_hidd_dev_connected(s_hid_dev);
 }
 
+bool ble_keyboard_text_client_connected(void)
+{
+    return s_text_connected;
+}
+
+bool ble_keyboard_text_notify_enabled(void)
+{
+    return s_text_connected && s_text_notify_enabled;
+}
+
+bool ble_keyboard_config_notify_enabled(void)
+{
+    return s_text_connected && s_config_notify_enabled;
+}
+
 esp_err_t ble_keyboard_reinitialize(void)
 {
     if (!s_started) {
