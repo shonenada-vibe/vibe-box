@@ -231,6 +231,18 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_TOUCH_POLL_MS 20
 #endif
 
+#ifdef CONFIG_VIBE_BOX_TOUCH_DOUBLE_TAP_MS
+#define VIBE_BOX_TOUCH_DOUBLE_TAP_MS CONFIG_VIBE_BOX_TOUCH_DOUBLE_TAP_MS
+#else
+#define VIBE_BOX_TOUCH_DOUBLE_TAP_MS 500
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TOUCH_TAP_MAX_MS
+#define VIBE_BOX_TOUCH_TAP_MAX_MS CONFIG_VIBE_BOX_TOUCH_TAP_MAX_MS
+#else
+#define VIBE_BOX_TOUCH_TAP_MAX_MS 300
+#endif
+
 /* Press-and-hold microphone trigger. Use the BOOT button on ESP32-S3,
  * which is typically wired to GPIO 0 and reads active-low with the
  * internal pull-up enabled. */
@@ -239,6 +251,7 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_RECORDING_MIN_MS         300U
 #define VIBE_BOX_BUTTON_POLL_MS           20
 #define VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES  3
+#define BLE_HID_KEY_ENTER                 0x28U
 
 static EventGroupHandle_t s_wifi_event_group;
 static esp_netif_t *s_sta_netif;
@@ -304,6 +317,8 @@ static runtime_config_t s_runtime_config;
 static query_result_t s_last_query_result;
 static ui_snapshot_t s_ui_snapshot;
 static uint32_t s_press_start_ms;
+static uint32_t s_touch_press_start_ms;
+static uint32_t s_touch_last_tap_release_ms;
 static TaskHandle_t s_ui_dashboard_task_handle;
 
 static const char *app_state_name(app_state_t state)
@@ -2150,15 +2165,47 @@ static void handle_press_release_and_upload(void)
     }
 }
 
+static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
+{
+    if (held_ms == 0U || held_ms > (uint32_t)VIBE_BOX_TOUCH_TAP_MAX_MS) {
+        s_touch_last_tap_release_ms = 0;
+        return;
+    }
+
+    if (s_touch_last_tap_release_ms != 0U &&
+        release_ms - s_touch_last_tap_release_ms <= (uint32_t)VIBE_BOX_TOUCH_DOUBLE_TAP_MS) {
+        s_touch_last_tap_release_ms = 0;
+        ESP_LOGI(TAG, "touch double tap detected; sending Enter key");
+
+        esp_err_t err = ble_keyboard_send_key(0, BLE_HID_KEY_ENTER);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "sent Enter key over BLE HID");
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "BLE HID keyboard not connected; Enter key not sent");
+        } else {
+            ESP_LOGW(TAG, "BLE HID Enter key send failed: %s", esp_err_to_name(err));
+        }
+    } else {
+        s_touch_last_tap_release_ms = release_ms;
+    }
+}
+
 static void on_touch_event(touch_event_t event, void *user_ctx)
 {
     (void)user_ctx;
     if (event == TOUCH_EVENT_DOWN) {
         ESP_LOGI(TAG, "touch down");
+        s_touch_press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
         handle_press_and_hold_recording();
     } else {
         ESP_LOGI(TAG, "touch up");
+        uint32_t release_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t held_ms = s_touch_press_start_ms != 0U
+                               ? release_ms - s_touch_press_start_ms
+                               : 0U;
+        s_touch_press_start_ms = 0;
         handle_press_release_and_upload();
+        handle_touch_tap_enter(release_ms, held_ms);
     }
 }
 
