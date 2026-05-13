@@ -27,6 +27,15 @@
 #define TEXT_OPCODE_BEGIN 0x01
 #define TEXT_OPCODE_CHUNK 0x02
 #define TEXT_OPCODE_END 0x03
+#define CONFIG_BUFFER_SIZE 2048
+#define CONFIG_OPCODE_GET 0x10
+#define CONFIG_OPCODE_SAVE_BEGIN 0x21
+#define CONFIG_OPCODE_SAVE_CHUNK 0x22
+#define CONFIG_OPCODE_SAVE_END 0x23
+#define CONFIG_OPCODE_RESP_BEGIN 0x81
+#define CONFIG_OPCODE_RESP_CHUNK 0x82
+#define CONFIG_OPCODE_RESP_END 0x83
+#define CONFIG_OPCODE_RESP_ERROR 0x84
 #define GATT_CCC_NOTIFY_ENABLE 0x0001
 
 static const char *TAG = "ble_keyboard";
@@ -43,6 +52,12 @@ static const uint8_t text_char_uuid[ESP_UUID_LEN_128] = {
     0x3f, 0x4b, 0x15, 0x7a, 0x01, 0xd1, 0xf2, 0x48,
 };
 
+/* 48f2d101-7a15-4b3f-8d67-60587f5d1003 */
+static const uint8_t config_char_uuid[ESP_UUID_LEN_128] = {
+    0x03, 0x10, 0x5d, 0x7f, 0x58, 0x60, 0x67, 0x8d,
+    0x3f, 0x4b, 0x15, 0x7a, 0x01, 0xd1, 0xf2, 0x48,
+};
+
 static const uint8_t hid_service_uuid128[ESP_UUID_LEN_128] = {
     0xfb, 0x34, 0x9b, 0x5f, 0x80, 0x00, 0x00, 0x80,
     0x00, 0x10, 0x00, 0x00, 0x12, 0x18, 0x00, 0x00,
@@ -54,13 +69,18 @@ static const uint16_t client_config_uuid = ESP_GATT_UUID_CHAR_CLIENT_CONFIG;
 static const uint8_t char_prop_notify_read_write =
     ESP_GATT_CHAR_PROP_BIT_NOTIFY | ESP_GATT_CHAR_PROP_BIT_READ | ESP_GATT_CHAR_PROP_BIT_WRITE;
 static uint8_t text_value[TEXT_NOTIFY_MTU_PAYLOAD_MAX] = {0};
+static uint8_t config_value[TEXT_NOTIFY_MTU_PAYLOAD_MAX] = {0};
 static uint8_t text_ccc[2] = {0, 0};
+static uint8_t config_ccc[2] = {0, 0};
 
 enum {
     TEXT_IDX_SVC,
     TEXT_IDX_CHAR_DECL,
     TEXT_IDX_CHAR_VAL,
     TEXT_IDX_CHAR_CCC,
+    TEXT_IDX_CONFIG_CHAR_DECL,
+    TEXT_IDX_CONFIG_CHAR_VAL,
+    TEXT_IDX_CONFIG_CHAR_CCC,
     TEXT_IDX_NB,
 };
 
@@ -84,6 +104,21 @@ static const esp_gatts_attr_db_t text_gatt_db[TEXT_IDX_NB] = {
         {{ESP_GATT_AUTO_RSP},
          {ESP_UUID_LEN_16, (uint8_t *)&client_config_uuid,
           ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(text_ccc), sizeof(text_ccc), text_ccc}},
+
+    [TEXT_IDX_CONFIG_CHAR_DECL] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16, (uint8_t *)&char_declare_uuid, ESP_GATT_PERM_READ,
+          sizeof(uint8_t), sizeof(uint8_t), (uint8_t *)&char_prop_notify_read_write}},
+
+    [TEXT_IDX_CONFIG_CHAR_VAL] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_128, (uint8_t *)config_char_uuid, ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE,
+          sizeof(config_value), 0, config_value}},
+
+    [TEXT_IDX_CONFIG_CHAR_CCC] =
+        {{ESP_GATT_AUTO_RSP},
+         {ESP_UUID_LEN_16, (uint8_t *)&client_config_uuid,
+          ESP_GATT_PERM_READ | ESP_GATT_PERM_WRITE, sizeof(config_ccc), sizeof(config_ccc), config_ccc}},
 };
 
 static const uint8_t keyboard_report_map[] = {
@@ -148,12 +183,27 @@ static uint16_t s_text_conn_id;
 static esp_bd_addr_t s_text_remote_bda;
 static esp_bd_addr_t s_peer_remote_bda;
 static esp_bd_addr_t s_random_addr;
+static ble_keyboard_config_get_cb_t s_config_get_cb;
+static ble_keyboard_config_set_cb_t s_config_set_cb;
+static void *s_config_ctx;
+static char s_config_rx_buffer[CONFIG_BUFFER_SIZE];
+static size_t s_config_rx_len;
 static bool s_peer_connected;
 static bool s_text_connected;
 static bool s_text_notify_enabled;
+static bool s_config_notify_enabled;
 static bool s_started;
 static bool s_adv_data_ready;
 static bool s_random_addr_ready;
+
+void ble_keyboard_set_config_callbacks(ble_keyboard_config_get_cb_t get_cb,
+                                       ble_keyboard_config_set_cb_t set_cb,
+                                       void *ctx)
+{
+    s_config_get_cb = get_cb;
+    s_config_set_cb = set_cb;
+    s_config_ctx = ctx;
+}
 
 static esp_err_t start_advertising(void)
 {
@@ -212,6 +262,160 @@ static esp_err_t set_new_random_address(void)
     return ESP_OK;
 }
 
+static esp_err_t notify_packet(uint16_t handle, uint8_t opcode, const uint8_t *payload, size_t payload_len)
+{
+    if (!s_text_connected || s_text_gatts_if == ESP_GATT_IF_NONE || handle == 0) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (payload_len > TEXT_NOTIFY_CHUNK_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    uint8_t packet[TEXT_NOTIFY_MTU_PAYLOAD_MAX] = {opcode};
+    if (payload_len > 0) {
+        memcpy(&packet[1], payload, payload_len);
+    }
+
+    return esp_ble_gatts_send_indicate(s_text_gatts_if, s_text_conn_id,
+                                       handle, payload_len + 1, packet, false);
+}
+
+static esp_err_t config_notify_response(uint8_t end_opcode, const char *payload)
+{
+    esp_err_t err;
+    const uint8_t *cursor = (const uint8_t *)(payload != NULL ? payload : "");
+    size_t len = strlen((const char *)cursor);
+
+    if (!s_config_notify_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = notify_packet(s_text_handles[TEXT_IDX_CONFIG_CHAR_VAL], CONFIG_OPCODE_RESP_BEGIN, NULL, 0);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    while (len > 0) {
+        size_t chunk_len = len > TEXT_NOTIFY_CHUNK_MAX ? TEXT_NOTIFY_CHUNK_MAX : len;
+
+        err = notify_packet(s_text_handles[TEXT_IDX_CONFIG_CHAR_VAL],
+                            CONFIG_OPCODE_RESP_CHUNK,
+                            cursor,
+                            chunk_len);
+        if (err != ESP_OK) {
+            return err;
+        }
+        cursor += chunk_len;
+        len -= chunk_len;
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    return notify_packet(s_text_handles[TEXT_IDX_CONFIG_CHAR_VAL], end_opcode, NULL, 0);
+}
+
+static void config_send_error(const char *message)
+{
+    esp_err_t err = config_notify_response(CONFIG_OPCODE_RESP_ERROR,
+                                           message != NULL ? message : "config request failed");
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "config error notify failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void config_handle_get(void)
+{
+    char response[CONFIG_BUFFER_SIZE];
+    esp_err_t err;
+
+    if (s_config_get_cb == NULL) {
+        config_send_error("config get callback missing");
+        return;
+    }
+
+    memset(response, 0, sizeof(response));
+    err = s_config_get_cb(response, sizeof(response), s_config_ctx);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "config get failed: %s", esp_err_to_name(err));
+        config_send_error(esp_err_to_name(err));
+        return;
+    }
+
+    err = config_notify_response(CONFIG_OPCODE_RESP_END, response);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "config get response notify failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void config_handle_save_end(void)
+{
+    char response[256];
+    esp_err_t err;
+
+    if (s_config_set_cb == NULL) {
+        config_send_error("config set callback missing");
+        return;
+    }
+    if (s_config_rx_len >= sizeof(s_config_rx_buffer)) {
+        s_config_rx_len = 0;
+        config_send_error("config payload too large");
+        return;
+    }
+
+    s_config_rx_buffer[s_config_rx_len] = '\0';
+    memset(response, 0, sizeof(response));
+    err = s_config_set_cb(s_config_rx_buffer, response, sizeof(response), s_config_ctx);
+    s_config_rx_len = 0;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "config set failed: %s", esp_err_to_name(err));
+        config_send_error(response[0] != '\0' ? response : esp_err_to_name(err));
+        return;
+    }
+
+    err = config_notify_response(CONFIG_OPCODE_RESP_END, response[0] != '\0' ? response : "{\"ok\":true}");
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "config set response notify failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void config_handle_write(const uint8_t *value, uint16_t len)
+{
+    uint8_t opcode;
+    const uint8_t *payload;
+    size_t payload_len;
+
+    if (value == NULL || len == 0) {
+        return;
+    }
+
+    opcode = value[0];
+    payload = &value[1];
+    payload_len = len - 1U;
+
+    switch (opcode) {
+    case CONFIG_OPCODE_GET:
+        config_handle_get();
+        break;
+    case CONFIG_OPCODE_SAVE_BEGIN:
+        s_config_rx_len = 0;
+        break;
+    case CONFIG_OPCODE_SAVE_CHUNK:
+        if ((s_config_rx_len + payload_len) >= sizeof(s_config_rx_buffer)) {
+            s_config_rx_len = sizeof(s_config_rx_buffer);
+            config_send_error("config payload too large");
+            return;
+        }
+        memcpy(&s_config_rx_buffer[s_config_rx_len], payload, payload_len);
+        s_config_rx_len += payload_len;
+        break;
+    case CONFIG_OPCODE_SAVE_END:
+        config_handle_save_end();
+        break;
+    default:
+        config_send_error("unknown config opcode");
+        break;
+    }
+}
+
 static void text_gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if,
                                esp_ble_gatts_cb_param_t *param)
 {
@@ -235,6 +439,9 @@ static void text_gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_i
                  s_text_handles[TEXT_IDX_SVC],
                  s_text_handles[TEXT_IDX_CHAR_VAL],
                  s_text_handles[TEXT_IDX_CHAR_CCC]);
+        ESP_LOGI(TAG, "config service ready val=0x%04x ccc=0x%04x",
+                 s_text_handles[TEXT_IDX_CONFIG_CHAR_VAL],
+                 s_text_handles[TEXT_IDX_CONFIG_CHAR_CCC]);
         break;
     case ESP_GATTS_CONNECT_EVT:
         s_text_connected = true;
@@ -245,6 +452,8 @@ static void text_gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_i
     case ESP_GATTS_DISCONNECT_EVT:
         s_text_connected = false;
         s_text_notify_enabled = false;
+        s_config_notify_enabled = false;
+        s_config_rx_len = 0;
         memset(s_text_remote_bda, 0, sizeof(s_text_remote_bda));
         ESP_LOGI(TAG, "text client disconnected");
         start_advertising();
@@ -258,6 +467,13 @@ static void text_gatts_handler(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_i
             ESP_LOGI(TAG, "text notifications %s via handle 0x%04x",
                      s_text_notify_enabled ? "enabled" : "disabled",
                      param->write.handle);
+        } else if (param->write.handle == s_text_handles[TEXT_IDX_CONFIG_CHAR_CCC] &&
+                   param->write.len == sizeof(config_ccc)) {
+            uint16_t ccc_value = (uint16_t)param->write.value[0] | ((uint16_t)param->write.value[1] << 8);
+            s_config_notify_enabled = (ccc_value & GATT_CCC_NOTIFY_ENABLE) != 0;
+            ESP_LOGI(TAG, "config notifications %s", s_config_notify_enabled ? "enabled" : "disabled");
+        } else if (param->write.handle == s_text_handles[TEXT_IDX_CONFIG_CHAR_VAL]) {
+            config_handle_write(param->write.value, param->write.len);
         }
         break;
     default:
@@ -394,6 +610,8 @@ esp_err_t ble_keyboard_reinitialize(void)
     s_peer_connected = false;
     s_text_connected = false;
     s_text_notify_enabled = false;
+    s_config_notify_enabled = false;
+    s_config_rx_len = 0;
     memset(s_peer_remote_bda, 0, sizeof(s_peer_remote_bda));
     memset(s_text_remote_bda, 0, sizeof(s_text_remote_bda));
 

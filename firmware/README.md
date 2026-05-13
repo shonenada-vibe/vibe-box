@@ -90,6 +90,14 @@ python host/vibebox_text_input.py
 - `--once`：连接断开后退出
 - `--verbose`：输出 BLE 调试日志
 
+也可以使用交互式 TUI：
+
+```sh
+python host/vibebox_tui.py
+```
+
+TUI 支持启动/停止 BLE 文本桥、切换粘贴后回车、编辑本机连接参数，并可通过 BLE 拉取、修改、保存运行时配置，不需要连接设备的配网 Wi-Fi AP。
+
 ## 真实音频采集
 
 - 当前已经有一个不依赖外部 codec 组件的 `I2S RX` 采集入口

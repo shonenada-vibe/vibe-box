@@ -249,6 +249,7 @@ static bool s_network_stack_ready;
 static bool s_wifi_driver_ready;
 static bool s_wifi_station_started;
 static bool s_provisioning_reconnect_requested;
+static bool s_runtime_config_reconnect_requested;
 
 typedef enum {
     APP_STATE_BOOT = 0,
@@ -547,6 +548,190 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
 exit:
     nvs_close(handle);
     return err;
+}
+
+static bool json_copy_string(cJSON *root, const char *key, char *dst, size_t dst_len, bool required)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+
+    if (item == NULL) {
+        return !required;
+    }
+    if (!cJSON_IsString(item) || item->valuestring == NULL ||
+        strlen(item->valuestring) >= dst_len) {
+        return false;
+    }
+
+    strlcpy(dst, item->valuestring, dst_len);
+    return true;
+}
+
+static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, size_t dst_len)
+{
+    cJSON *root = NULL;
+    char *printed = NULL;
+    esp_err_t err = ESP_OK;
+
+    if (cfg == NULL || dst == NULL || dst_len == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    root = cJSON_CreateObject();
+    if (root == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    if (cJSON_AddStringToObject(root, "wifi_ssid", cfg->wifi_ssid) == NULL ||
+        cJSON_AddStringToObject(root, "wifi_password", cfg->wifi_password) == NULL ||
+        cJSON_AddStringToObject(root, "whisper_api_url", cfg->whisper_api_url) == NULL ||
+        cJSON_AddStringToObject(root, "whisper_api_key", cfg->whisper_api_key) == NULL ||
+        cJSON_AddStringToObject(root, "stt_model", cfg->stt_model) == NULL ||
+        cJSON_AddStringToObject(root, "device_id", cfg->device_id) == NULL ||
+        cJSON_AddStringToObject(root, "firmware_version", cfg->firmware_version) == NULL ||
+        cJSON_AddStringToObject(root, "language", cfg->language) == NULL ||
+        cJSON_AddNumberToObject(root,
+                                "recording_duration_ms",
+                                (double)cfg->recording_duration_ms) == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    printed = cJSON_PrintUnformatted(root);
+    if (printed == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    if (strlen(printed) >= dst_len) {
+        err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+
+    strlcpy(dst, printed, dst_len);
+
+cleanup:
+    if (printed != NULL) {
+        cJSON_free(printed);
+    }
+    cJSON_Delete(root);
+    return err;
+}
+
+static void fill_runtime_config_defaults(runtime_config_t *cfg)
+{
+    if (cfg->device_id[0] == '\0') {
+        strlcpy(cfg->device_id, "vibe-box-dev", sizeof(cfg->device_id));
+    }
+    if (cfg->firmware_version[0] == '\0') {
+        strlcpy(cfg->firmware_version, "dev", sizeof(cfg->firmware_version));
+    }
+    if (cfg->language[0] == '\0') {
+        strlcpy(cfg->language, "zh", sizeof(cfg->language));
+    }
+    if (cfg->stt_model[0] == '\0') {
+        strlcpy(cfg->stt_model, VIBE_BOX_DEFAULT_STT_MODEL, sizeof(cfg->stt_model));
+    }
+    if (cfg->recording_duration_ms == 0U) {
+        cfg->recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+    }
+}
+
+static esp_err_t runtime_config_update_from_json(const char *json, runtime_config_t *next_config)
+{
+    cJSON *root = NULL;
+    cJSON *rec_ms = NULL;
+    esp_err_t err = ESP_OK;
+
+    if (json == NULL || next_config == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    root = cJSON_Parse(json);
+    if (root == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (!json_copy_string(root, "wifi_ssid", next_config->wifi_ssid, sizeof(next_config->wifi_ssid), true) ||
+        !json_copy_string(root,
+                          "wifi_password",
+                          next_config->wifi_password,
+                          sizeof(next_config->wifi_password),
+                          false) ||
+        !json_copy_string(root,
+                          "whisper_api_url",
+                          next_config->whisper_api_url,
+                          sizeof(next_config->whisper_api_url),
+                          true) ||
+        !json_copy_string(root,
+                          "whisper_api_key",
+                          next_config->whisper_api_key,
+                          sizeof(next_config->whisper_api_key),
+                          false) ||
+        !json_copy_string(root, "stt_model", next_config->stt_model, sizeof(next_config->stt_model), false) ||
+        !json_copy_string(root, "device_id", next_config->device_id, sizeof(next_config->device_id), false) ||
+        !json_copy_string(root,
+                          "firmware_version",
+                          next_config->firmware_version,
+                          sizeof(next_config->firmware_version),
+                          false) ||
+        !json_copy_string(root, "language", next_config->language, sizeof(next_config->language), false)) {
+        err = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+    rec_ms = cJSON_GetObjectItemCaseSensitive(root, "recording_duration_ms");
+    if (rec_ms != NULL) {
+        if (!cJSON_IsNumber(rec_ms) || rec_ms->valuedouble < 1000.0 ||
+            rec_ms->valuedouble > 15000.0) {
+            err = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        next_config->recording_duration_ms = (uint32_t)rec_ms->valuedouble;
+    }
+
+    fill_runtime_config_defaults(next_config);
+    if (!runtime_config_is_complete(next_config)) {
+        err = ESP_ERR_INVALID_ARG;
+        goto cleanup;
+    }
+
+cleanup:
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t ble_config_get_handler(char *dst, size_t dst_len, void *ctx)
+{
+    (void)ctx;
+    return runtime_config_to_json(&s_runtime_config, dst, dst_len);
+}
+
+static esp_err_t ble_config_set_handler(const char *json, char *response, size_t response_len, void *ctx)
+{
+    runtime_config_t next_config = s_runtime_config;
+    esp_err_t err;
+
+    (void)ctx;
+    err = runtime_config_update_from_json(json, &next_config);
+    if (err != ESP_OK) {
+        strlcpy(response, "{\"ok\":false,\"error\":\"invalid config\"}", response_len);
+        return err;
+    }
+
+    err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        snprintf(response,
+                 response_len,
+                 "{\"ok\":false,\"error\":\"%s\"}",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    s_runtime_config = next_config;
+    s_provisioning_reconnect_requested = true;
+    s_runtime_config_reconnect_requested = true;
+    log_runtime_config(&s_runtime_config, "ble-updated");
+    strlcpy(response, "{\"ok\":true,\"reconnect\":true}", response_len);
+    return ESP_OK;
 }
 
 static esp_err_t http_event_handler(esp_http_client_event_t *evt)
@@ -2126,6 +2311,7 @@ void app_main(void)
     ESP_ERROR_CHECK(storage_load_runtime_config(&s_runtime_config, &loaded_from_nvs));
     log_runtime_config(&s_runtime_config, loaded_from_nvs ? "nvs+defaults" : "menuconfig-defaults");
 
+    ble_keyboard_set_config_callbacks(ble_config_get_handler, ble_config_set_handler, NULL);
     esp_err_t ble_err = ble_keyboard_init();
     if (ble_err != ESP_OK) {
         ESP_LOGE(TAG, "ble_keyboard_init failed: %s", esp_err_to_name(ble_err));
@@ -2189,6 +2375,18 @@ void app_main(void)
 #endif
 
     while (true) {
+        if (s_runtime_config_reconnect_requested && state != APP_STATE_RECORDING &&
+            state != APP_STATE_UPLOADING) {
+            s_runtime_config_reconnect_requested = false;
+            s_provisioning_reconnect_requested = false;
+            if (!runtime_config_is_complete(&s_runtime_config)) {
+                ESP_ERROR_CHECK(enter_provisioning_mode(&state, "ble runtime config incomplete"));
+            } else if (connect_using_runtime_config(&state, "ble runtime config applied") != ESP_OK) {
+                set_state(&state, APP_STATE_ERROR, "wifi connect after BLE config failed");
+                render_ui_status(state, "Error", "BLE config wifi connect failed");
+            }
+        }
+
         if (state == APP_STATE_IDLE) {
             esp_err_t err;
 
