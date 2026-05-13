@@ -66,7 +66,7 @@ Useful checks:
 
 ```sh
 git diff --check
-python3 -m py_compile host/vibebox_text_input.py
+python3 -m py_compile host/vibebox_text_input.py host/vibebox_tui.py
 ```
 
 Flash/monitor, adjust port as needed:
@@ -87,6 +87,14 @@ python host/vibebox_text_input.py
 
 macOS must grant Accessibility permission to the terminal app running the helper, otherwise paste will fail.
 
+Interactive host TUI:
+
+```sh
+python host/vibebox_tui.py
+```
+
+The TUI runs the same BLE text notification bridge, stores host-side settings in `~/.config/vibebox/tui.json`, and can fetch/edit/save runtime config over BLE without joining the provisioning Wi-Fi AP.
+
 ## BLE Notes
 
 Device name: `VibeBox`.
@@ -95,11 +103,16 @@ Current custom text service:
 
 - Service UUID: `48f2d101-7a15-4b3f-8d67-60587f5d1001`
 - Characteristic UUID: `48f2d101-7a15-4b3f-8d67-60587f5d1002`
+- Config characteristic UUID: `48f2d101-7a15-4b3f-8d67-60587f5d1003`
 - Notification packet format:
   - byte 0 opcode
   - `0x01`: begin, clears host buffer
   - `0x02`: UTF-8 chunk payload
   - `0x03`: end, host decodes and pastes
+- Config packet format:
+  - host writes `0x10` to fetch JSON config
+  - host writes `0x21` begin, `0x22` UTF-8 JSON chunks, `0x23` end to save config
+  - device notifies `0x81` begin, `0x82` UTF-8 JSON/text chunks, `0x83` success end, or `0x84` error end
 
 Important history:
 
