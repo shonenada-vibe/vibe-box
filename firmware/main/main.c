@@ -13,6 +13,7 @@
 
 #include "audio_input.h"
 #include "ble_keyboard.h"
+#include "touch_input.h"
 #include "ui_epaper.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
@@ -191,6 +192,36 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_I2S_CHANNELS CONFIG_VIBE_BOX_I2S_CHANNELS
 #else
 #define VIBE_BOX_I2S_CHANNELS 1
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TOUCH_ENABLE
+#define VIBE_BOX_TOUCH_ENABLE 1
+#else
+#define VIBE_BOX_TOUCH_ENABLE 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TOUCH_RST_GPIO
+#define VIBE_BOX_TOUCH_RST_GPIO CONFIG_VIBE_BOX_TOUCH_RST_GPIO
+#else
+#define VIBE_BOX_TOUCH_RST_GPIO 7
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TOUCH_INT_GPIO
+#define VIBE_BOX_TOUCH_INT_GPIO CONFIG_VIBE_BOX_TOUCH_INT_GPIO
+#else
+#define VIBE_BOX_TOUCH_INT_GPIO 21
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TOUCH_I2C_ADDR
+#define VIBE_BOX_TOUCH_I2C_ADDR CONFIG_VIBE_BOX_TOUCH_I2C_ADDR
+#else
+#define VIBE_BOX_TOUCH_I2C_ADDR 0x38
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TOUCH_POLL_MS
+#define VIBE_BOX_TOUCH_POLL_MS CONFIG_VIBE_BOX_TOUCH_POLL_MS
+#else
+#define VIBE_BOX_TOUCH_POLL_MS 20
 #endif
 
 /* Press-and-hold microphone trigger. Use the BOOT button on ESP32-S3,
@@ -1826,6 +1857,18 @@ static void handle_press_release_and_upload(void)
     }
 }
 
+static void on_touch_event(touch_event_t event, void *user_ctx)
+{
+    (void)user_ctx;
+    if (event == TOUCH_EVENT_DOWN) {
+        ESP_LOGI(TAG, "touch down");
+        handle_press_and_hold_recording();
+    } else {
+        ESP_LOGI(TAG, "touch up");
+        handle_press_release_and_upload();
+    }
+}
+
 static void audio_button_task(void *arg)
 {
     (void)arg;
@@ -1992,6 +2035,32 @@ void app_main(void)
                                 tskNO_AFFINITY) != pdPASS) {
         ESP_LOGE(TAG, "failed to create pwr_button_task");
     }
+
+#if VIBE_BOX_TOUCH_ENABLE
+    {
+        touch_input_config_t touch_cfg = {
+            .i2c_port = VIBE_BOX_I2C_PORT,
+            .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
+            .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
+            .reset_gpio = VIBE_BOX_TOUCH_RST_GPIO,
+            .int_gpio = VIBE_BOX_TOUCH_INT_GPIO,
+            .i2c_addr = (uint8_t)VIBE_BOX_TOUCH_I2C_ADDR,
+            .i2c_speed_hz = 100000,
+            .poll_period_ms = (uint32_t)VIBE_BOX_TOUCH_POLL_MS,
+            .debounce_samples = 2,
+        };
+        esp_err_t terr = touch_input_init(&touch_cfg, on_touch_event, NULL);
+        if (terr != ESP_OK) {
+            ESP_LOGE(TAG, "touch_input_init failed: %s", esp_err_to_name(terr));
+        } else {
+            ESP_LOGI(TAG,
+                     "touch press-and-hold ready (rst=GPIO%d int=GPIO%d addr=0x%02x)",
+                     VIBE_BOX_TOUCH_RST_GPIO,
+                     VIBE_BOX_TOUCH_INT_GPIO,
+                     VIBE_BOX_TOUCH_I2C_ADDR);
+        }
+    }
+#endif
 
     while (true) {
         if (state == APP_STATE_IDLE) {

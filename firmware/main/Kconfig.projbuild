@@ -205,6 +205,49 @@ config VIBE_BOX_I2S_CHANNELS
     help
         Channel count used for captured PCM data.
 
+config VIBE_BOX_TOUCH_ENABLE
+    bool "Enable capacitive touch press-and-hold trigger"
+    default y
+    help
+        When enabled, a finger touch on the e-paper screen starts/stops a
+        recording in exactly the same way as the BOOT button.
+
+config VIBE_BOX_TOUCH_RST_GPIO
+    int "Touch panel RST GPIO"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range -1 48
+    default 7
+    help
+        GPIO connected to the CST816T RST pin (active low). Set to -1 to skip
+        the reset pulse entirely.
+
+config VIBE_BOX_TOUCH_INT_GPIO
+    int "Touch panel INT GPIO"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range -1 48
+    default 21
+    help
+        GPIO connected to the CST816T INT pin. Currently informational only;
+        the driver polls register 0x02 over I2C. Set to -1 to skip pin setup.
+
+config VIBE_BOX_TOUCH_I2C_ADDR
+    hex "Touch panel I2C address"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range 0x08 0x77
+    default 0x38
+    help
+        7-bit I2C address used by the on-board capacitive touch controller.
+        Waveshare's V2 board ships with FT6336 at 0x38; some variants use
+        CST816T at 0x15.
+
+config VIBE_BOX_TOUCH_POLL_MS
+    int "Touch poll interval (ms)"
+    depends on VIBE_BOX_TOUCH_ENABLE
+    range 5 200
+    default 20
+    help
+        Period at which the touch driver polls the FingerNum register.
+
 config VIBE_BOX_WIFI_MAXIMUM_RETRY
     int "Wi-Fi maximum retry count"
     range 1 20
