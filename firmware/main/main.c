@@ -1881,41 +1881,31 @@ static void ui_dashboard_render_once(void)
     ui_epaper_draw_hline(y, x, UI_EPAPER_WIDTH - x - 1);
     y += 3;
 
-    /* API result block */
-    ui_epaper_draw_text(x, y, "Result:");
+    /* BLE block */
+    ui_epaper_draw_text(x, y, "Bluetooth:");
     y += line_step;
 
-    bool any_result = false;
-    if (s_last_query_result.transcript[0] != '\0') {
-        snprintf(line, sizeof(line), "Q:%.21s", s_last_query_result.transcript);
-        ui_epaper_draw_text(x, y, line);
-        y += line_step;
-        any_result = true;
+    snprintf(line, sizeof(line),
+             "HID: %s",
+             ble_keyboard_is_connected() ? "connected" : "waiting");
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    const char *text_state = "waiting";
+    if (ble_keyboard_text_notify_enabled()) {
+        text_state = "ready";
+    } else if (ble_keyboard_text_client_connected()) {
+        text_state = "connected";
     }
-    if (s_last_query_result.reply_text[0] != '\0') {
-        snprintf(line, sizeof(line), "A:%.21s", s_last_query_result.reply_text);
-        ui_epaper_draw_text(x, y, line);
-        y += line_step;
-        any_result = true;
-    }
-    for (size_t i = 0; i < s_last_query_result.display_line_count; ++i) {
-        if (y + line_step > UI_EPAPER_HEIGHT - 12) {
-            break;
-        }
-        snprintf(line, sizeof(line), "%.23s", s_last_query_result.display_lines[i]);
-        ui_epaper_draw_text(x, y, line);
-        y += line_step;
-        any_result = true;
-    }
-    if (!any_result) {
-        if (s_ui_snapshot.detail[0] != '\0') {
-            snprintf(line, sizeof(line), "%.23s", s_ui_snapshot.detail);
-            ui_epaper_draw_text(x, y, line);
-        } else {
-            ui_epaper_draw_text(x, y, "(no result yet)");
-        }
-        y += line_step;
-    }
+    snprintf(line, sizeof(line), "Text: %s", text_state);
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    snprintf(line, sizeof(line),
+             "Config: %s",
+             ble_keyboard_config_notify_enabled() ? "ready" : "waiting");
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
 
     /* Footer: heap + uptime */
     int footer_y = UI_EPAPER_HEIGHT - line_step - 2;
