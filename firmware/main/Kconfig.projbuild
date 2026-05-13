@@ -27,34 +27,55 @@ config VIBE_BOX_PROVISIONING_AP_PASSWORD
         at least 8 characters for WPA/WPA2 protection.
 
 config VIBE_BOX_SERVER_BASE_URL
-    string "Server base URL"
+    string "Legacy thin server base URL"
     default "http://192.168.1.100:8000"
     help
-        Base URL for the thin server, for example http://192.168.1.100:8000.
+        Legacy base URL for the previous thin server path. Direct Whisper mode uses
+        VIBE_BOX_WHISPER_API_URL instead.
 
 config VIBE_BOX_API_TOKEN
-    string "API token"
+    string "Legacy thin server API token"
     default ""
     help
-        Optional bearer token sent to the thin server in the Authorization header.
+        Legacy bearer token for the previous thin server path. Direct Whisper mode uses
+        VIBE_BOX_WHISPER_API_KEY instead.
+
+config VIBE_BOX_WHISPER_API_URL
+    string "Whisper-compatible API URL"
+    default "http://192.168.1.100:8000/v1/audio/transcriptions"
+    help
+        Full Whisper-compatible transcription endpoint URL. The firmware sends captured
+        WAV audio directly here as multipart/form-data with the file field named "file".
+
+config VIBE_BOX_WHISPER_API_KEY
+    string "Whisper-compatible API key"
+    default ""
+    help
+        Optional bearer token sent to the Whisper-compatible transcription endpoint.
+
+config VIBE_BOX_STT_MODEL
+    string "STT model"
+    default "whisper-large-v3-turbo"
+    help
+        Model form field sent to the Whisper-compatible transcription endpoint.
 
 config VIBE_BOX_DEVICE_ID
     string "Device ID"
     default "vibe-box-dev"
     help
-        Logical device ID sent to the thin server.
+        Logical device ID retained in runtime config and diagnostics.
 
 config VIBE_BOX_FIRMWARE_VERSION
     string "Firmware version"
     default "dev"
     help
-        Firmware version string sent to the thin server.
+        Firmware version retained in runtime config and diagnostics.
 
 config VIBE_BOX_LANGUAGE
     string "Language"
     default "zh"
     help
-        Default language sent to the thin server.
+        Default language sent to the Whisper-compatible transcription endpoint.
 
 config VIBE_BOX_RECORDING_DURATION_MS
     int "Recording duration (ms)"
@@ -64,11 +85,26 @@ config VIBE_BOX_RECORDING_DURATION_MS
         Target recording duration for microphone capture and upload.
 
 config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
-    int "Health poll interval (ms)"
+    int "Network readiness check interval (ms)"
     range 1000 600000
     default 10000
     help
-        Interval used to call GET /health after Wi-Fi is connected.
+        Interval used to check Wi-Fi readiness while idle.
+
+config VIBE_BOX_PWR_BUTTON_GPIO
+    int "PWR button GPIO"
+    range -1 48
+    default 18
+    help
+        GPIO connected to the board PWR button. The Waveshare ESP32-S3-ePaper-1.54
+        examples use GPIO18 and treat the button as active-low.
+
+config VIBE_BOX_PWR_DOUBLE_CLICK_MS
+    int "PWR double click window (ms)"
+    range 150 1500
+    default 500
+    help
+        Maximum interval between two PWR button releases to trigger BLE reinitialization.
 
 config VIBE_BOX_ENABLE_I2S_CAPTURE
     bool "Enable I2S RX audio capture"
