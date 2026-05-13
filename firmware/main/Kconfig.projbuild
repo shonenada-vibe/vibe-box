@@ -108,6 +108,14 @@ config VIBE_BOX_PWR_LONG_PRESS_MS
         the device off (when on) or to confirm a power-on (when waking
         from deep sleep).
 
+config VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS
+    int "BOOT long-press restart duration (ms)"
+    range 1000 15000
+    default 3000
+    help
+        Hold the BOOT button continuously for at least this long to restart
+        the device.
+
 config VIBE_BOX_ENABLE_I2S_CAPTURE
     bool "Enable I2S RX audio capture"
     default y

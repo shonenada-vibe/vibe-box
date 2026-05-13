@@ -136,6 +136,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_PWR_LONG_PRESS_MS 5000
 #endif
 
+#ifdef CONFIG_VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS
+#define VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS CONFIG_VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS
+#else
+#define VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS 3000
+#endif
+
 #ifdef CONFIG_VIBE_BOX_I2C_SDA_GPIO
 #define VIBE_BOX_I2C_SDA_GPIO CONFIG_VIBE_BOX_I2C_SDA_GPIO
 #else
@@ -2205,6 +2211,31 @@ static void handle_press_release_and_upload(record_owner_t owner)
     s_record_owner = RECORD_OWNER_NONE;
 }
 
+static void discard_active_recording(record_owner_t owner)
+{
+    if (!audio_input_recording_is_active()) {
+        return;
+    }
+    if (s_record_owner != owner && s_record_owner != RECORD_OWNER_NONE) {
+        ESP_LOGW(TAG,
+                 "%s discard ignored; active recording owner is %s",
+                 record_owner_name(owner),
+                 record_owner_name(s_record_owner));
+        return;
+    }
+
+    uint8_t *wav_buf = NULL;
+    size_t wav_size = 0;
+    uint32_t duration_ms = 0;
+    esp_err_t err = audio_input_recording_stop(&wav_buf, &wav_size, &duration_ms);
+    free(wav_buf);
+    s_press_start_ms = 0;
+    s_record_owner = RECORD_OWNER_NONE;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_SIZE) {
+        ESP_LOGW(TAG, "discard recording stop failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
 {
     if (held_ms == 0U || held_ms > (uint32_t)VIBE_BOX_TOUCH_TAP_MAX_MS) {
@@ -2316,6 +2347,8 @@ static void audio_button_task(void *arg)
     int stable_level = 1;
     int candidate_level = 1;
     int candidate_count = 0;
+    uint32_t press_start_ms = 0;
+    bool restart_fired = false;
 
     while (true) {
         int level = gpio_get_level(VIBE_BOX_RECORD_BUTTON_GPIO);
@@ -2333,10 +2366,29 @@ static void audio_button_task(void *arg)
             stable_level = candidate_level;
             if (stable_level == 0) {
                 ESP_LOGI(TAG, "BOOT button pressed");
+                press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                restart_fired = false;
                 handle_press_and_hold_recording(RECORD_OWNER_BOOT);
             } else {
                 ESP_LOGI(TAG, "BOOT button released");
-                handle_press_release_and_upload(RECORD_OWNER_BOOT);
+                press_start_ms = 0;
+                if (restart_fired) {
+                    restart_fired = false;
+                } else {
+                    handle_press_release_and_upload(RECORD_OWNER_BOOT);
+                }
+            }
+        }
+
+        if (stable_level == 0 && !restart_fired && press_start_ms != 0U) {
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if (now_ms - press_start_ms >= (uint32_t)VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS) {
+                restart_fired = true;
+                ESP_LOGI(TAG, "BOOT long-press detected; restarting");
+                render_ui_status(APP_STATE_IDLE, "Restarting", "BOOT long press");
+                discard_active_recording(RECORD_OWNER_BOOT);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
             }
         }
 
