@@ -12,11 +12,13 @@
 #include "freertos/task.h"
 
 #include "audio_input.h"
+#include "ble_keyboard.h"
 #include "ui_epaper.h"
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_check.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -47,11 +49,14 @@ static const char *TAG = "vibe_box";
 #define RUNTIME_WIFI_PASSWORD_MAX       65
 #define RUNTIME_SERVER_BASE_URL_MAX     192
 #define RUNTIME_API_TOKEN_MAX           192
+#define RUNTIME_WHISPER_API_URL_MAX     256
+#define RUNTIME_WHISPER_API_KEY_MAX     256
+#define RUNTIME_STT_MODEL_MAX           96
 #define RUNTIME_DEVICE_ID_MAX           64
 #define RUNTIME_FIRMWARE_VERSION_MAX    64
 #define RUNTIME_LANGUAGE_MAX            16
 #define PROVISIONING_FORM_BUFFER_SIZE   1024
-#define PROVISIONING_HTML_BUFFER_SIZE   3072
+#define PROVISIONING_HTML_BUFFER_SIZE   4096
 #define PROVISIONING_STATUS_BUFFER_SIZE 1024
 #define WIFI_CONNECT_TIMEOUT_MS         30000
 #define NVS_NAMESPACE                   "vibe_box"
@@ -60,6 +65,24 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_DEFAULT_API_TOKEN CONFIG_VIBE_BOX_API_TOKEN
 #else
 #define VIBE_BOX_DEFAULT_API_TOKEN ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_WHISPER_API_URL
+#define VIBE_BOX_DEFAULT_WHISPER_API_URL CONFIG_VIBE_BOX_WHISPER_API_URL
+#else
+#define VIBE_BOX_DEFAULT_WHISPER_API_URL ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_WHISPER_API_KEY
+#define VIBE_BOX_DEFAULT_WHISPER_API_KEY CONFIG_VIBE_BOX_WHISPER_API_KEY
+#else
+#define VIBE_BOX_DEFAULT_WHISPER_API_KEY ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_STT_MODEL
+#define VIBE_BOX_DEFAULT_STT_MODEL CONFIG_VIBE_BOX_STT_MODEL
+#else
+#define VIBE_BOX_DEFAULT_STT_MODEL "whisper-large-v3-turbo"
 #endif
 
 #ifdef CONFIG_VIBE_BOX_LANGUAGE
@@ -90,6 +113,18 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_I2C_PORT CONFIG_VIBE_BOX_I2C_PORT
 #else
 #define VIBE_BOX_I2C_PORT 0
+#endif
+
+#ifdef CONFIG_VIBE_BOX_PWR_BUTTON_GPIO
+#define VIBE_BOX_PWR_BUTTON_GPIO CONFIG_VIBE_BOX_PWR_BUTTON_GPIO
+#else
+#define VIBE_BOX_PWR_BUTTON_GPIO 18
+#endif
+
+#ifdef CONFIG_VIBE_BOX_PWR_DOUBLE_CLICK_MS
+#define VIBE_BOX_PWR_DOUBLE_CLICK_MS CONFIG_VIBE_BOX_PWR_DOUBLE_CLICK_MS
+#else
+#define VIBE_BOX_PWR_DOUBLE_CLICK_MS 500
 #endif
 
 #ifdef CONFIG_VIBE_BOX_I2C_SDA_GPIO
@@ -192,6 +227,9 @@ typedef struct {
     char wifi_password[RUNTIME_WIFI_PASSWORD_MAX];
     char server_base_url[RUNTIME_SERVER_BASE_URL_MAX];
     char api_token[RUNTIME_API_TOKEN_MAX];
+    char whisper_api_url[RUNTIME_WHISPER_API_URL_MAX];
+    char whisper_api_key[RUNTIME_WHISPER_API_KEY_MAX];
+    char stt_model[RUNTIME_STT_MODEL_MAX];
     char device_id[RUNTIME_DEVICE_ID_MAX];
     char firmware_version[RUNTIME_FIRMWARE_VERSION_MAX];
     char language[RUNTIME_LANGUAGE_MAX];
@@ -275,6 +313,13 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
             CONFIG_VIBE_BOX_SERVER_BASE_URL,
             sizeof(cfg->server_base_url));
     strlcpy(cfg->api_token, VIBE_BOX_DEFAULT_API_TOKEN, sizeof(cfg->api_token));
+    strlcpy(cfg->whisper_api_url,
+            VIBE_BOX_DEFAULT_WHISPER_API_URL,
+            sizeof(cfg->whisper_api_url));
+    strlcpy(cfg->whisper_api_key,
+            VIBE_BOX_DEFAULT_WHISPER_API_KEY,
+            sizeof(cfg->whisper_api_key));
+    strlcpy(cfg->stt_model, VIBE_BOX_DEFAULT_STT_MODEL, sizeof(cfg->stt_model));
     strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
     strlcpy(cfg->firmware_version,
             CONFIG_VIBE_BOX_FIRMWARE_VERSION,
@@ -285,7 +330,7 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
 
 static bool runtime_config_is_complete(const runtime_config_t *cfg)
 {
-    return cfg->wifi_ssid[0] != '\0' && cfg->server_base_url[0] != '\0';
+    return cfg->wifi_ssid[0] != '\0' && cfg->whisper_api_url[0] != '\0';
 }
 
 static void log_runtime_config(const runtime_config_t *cfg, const char *source)
@@ -298,6 +343,9 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  wifi_password=%s", cfg->wifi_password[0] ? "<configured>" : "<empty>");
     ESP_LOGI(TAG, "  server_base_url=%s", cfg->server_base_url[0] ? cfg->server_base_url : "<empty>");
     ESP_LOGI(TAG, "  api_token=%s", cfg->api_token[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG, "  whisper_api_url=%s", cfg->whisper_api_url[0] ? cfg->whisper_api_url : "<empty>");
+    ESP_LOGI(TAG, "  whisper_api_key=%s", cfg->whisper_api_key[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG, "  stt_model=%s", cfg->stt_model[0] ? cfg->stt_model : "<empty>");
     ESP_LOGI(TAG, "  device_id=%s", cfg->device_id[0] ? cfg->device_id : "<empty>");
     ESP_LOGI(TAG,
              "  firmware_version=%s",
@@ -370,6 +418,9 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
     nvs_load_string_or_default(handle, "wifi_pass", cfg->wifi_password, sizeof(cfg->wifi_password));
     nvs_load_string_or_default(handle, "server_url", cfg->server_base_url, sizeof(cfg->server_base_url));
     nvs_load_string_or_default(handle, "api_token", cfg->api_token, sizeof(cfg->api_token));
+    nvs_load_string_or_default(handle, "whisper_url", cfg->whisper_api_url, sizeof(cfg->whisper_api_url));
+    nvs_load_string_or_default(handle, "whisper_key", cfg->whisper_api_key, sizeof(cfg->whisper_api_key));
+    nvs_load_string_or_default(handle, "stt_model", cfg->stt_model, sizeof(cfg->stt_model));
     nvs_load_string_or_default(handle, "device_id", cfg->device_id, sizeof(cfg->device_id));
     nvs_load_string_or_default(handle, "fw_ver", cfg->firmware_version, sizeof(cfg->firmware_version));
     nvs_load_string_or_default(handle, "language", cfg->language, sizeof(cfg->language));
@@ -412,6 +463,21 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
     err = nvs_set_str(handle, "api_token", cfg->api_token);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "save api_token failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "whisper_url", cfg->whisper_api_url);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save whisper_url failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "whisper_key", cfg->whisper_api_key);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save whisper_key failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "stt_model", cfg->stt_model);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save stt_model failed: %s", esp_err_to_name(err));
         goto exit;
     }
     err = nvs_set_str(handle, "device_id", cfg->device_id);
@@ -845,6 +911,7 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
                                       const char *path,
                                       esp_http_client_method_t method,
                                       const char *content_type,
+                                      const char *bearer_token,
                                       const uint8_t *body,
                                       size_t body_len,
                                       char *response_buf,
@@ -862,13 +929,23 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
         .url = url,
         .method = method,
         .event_handler = http_event_handler,
-        .timeout_ms = 5000,
+        .timeout_ms = 120000,
         .user_data = (response_buf != NULL && response_buf_size > 0U) ? &response_ctx : NULL,
+#ifdef CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+        .crt_bundle_attach = esp_crt_bundle_attach,
+#endif
     };
 
-    if (snprintf(url, sizeof(url), "%s%s", cfg->server_base_url, path) >= (int)sizeof(url)) {
-        ESP_LOGE(TAG, "server URL too long path=%s", path);
-        return ESP_ERR_INVALID_SIZE;
+    if (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0) {
+        if (snprintf(url, sizeof(url), "%s", path) >= (int)sizeof(url)) {
+            ESP_LOGE(TAG, "request URL too long");
+            return ESP_ERR_INVALID_SIZE;
+        }
+    } else {
+        if (snprintf(url, sizeof(url), "%s%s", cfg->server_base_url, path) >= (int)sizeof(url)) {
+            ESP_LOGE(TAG, "server URL too long path=%s", path);
+            return ESP_ERR_INVALID_SIZE;
+        }
     }
 
     ESP_LOGI(TAG, "http request begin method=%d url=%s", method, url);
@@ -885,10 +962,10 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
     if (content_type != NULL) {
         ESP_ERROR_CHECK(esp_http_client_set_header(client, "Content-Type", content_type));
     }
-    if (cfg->api_token[0] != '\0') {
-        char bearer_header[256];
+    if (bearer_token != NULL && bearer_token[0] != '\0') {
+        char bearer_header[RUNTIME_WHISPER_API_KEY_MAX + 16U];
 
-        if (snprintf(bearer_header, sizeof(bearer_header), "Bearer %s", cfg->api_token) <
+        if (snprintf(bearer_header, sizeof(bearer_header), "Bearer %s", bearer_token) <
             (int)sizeof(bearer_header)) {
             ESP_ERROR_CHECK(esp_http_client_set_header(client, "Authorization", bearer_header));
         }
@@ -929,12 +1006,10 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
 
 static esp_err_t health_check_once(const runtime_config_t *cfg)
 {
-    char response_buf[HEALTH_RESPONSE_BUFFER_SIZE] = {0};
-    int status = 0;
+    (void)cfg;
 
-    ESP_LOGI(TAG, "health check begin");
-    return perform_http_request(
-        cfg, "/health", HTTP_METHOD_GET, NULL, NULL, 0U, response_buf, sizeof(response_buf), &status);
+    ESP_LOGI(TAG, "network readiness check begin");
+    return wifi_is_connected() ? ESP_OK : ESP_FAIL;
 }
 
 static void clear_query_result(query_result_t *result)
@@ -982,136 +1057,35 @@ static void render_ui_query_result(const query_result_t *result)
     }
 }
 
-static int hex_nibble_value(char ch)
-{
-    if (ch >= '0' && ch <= '9') {
-        return ch - '0';
-    }
-    if (ch >= 'a' && ch <= 'f') {
-        return 10 + (ch - 'a');
-    }
-    if (ch >= 'A' && ch <= 'F') {
-        return 10 + (ch - 'A');
-    }
-    return -1;
-}
-
-static bool decode_hex_bitmap(const char *src, uint8_t *dst, size_t dst_len)
-{
-    size_t src_len;
-
-    if (src == NULL || dst == NULL) {
-        return false;
-    }
-
-    src_len = strlen(src);
-    if (src_len != dst_len * 2U) {
-        return false;
-    }
-
-    for (size_t i = 0; i < dst_len; ++i) {
-        int hi = hex_nibble_value(src[i * 2U]);
-        int lo = hex_nibble_value(src[(i * 2U) + 1U]);
-        if (hi < 0 || lo < 0) {
-            return false;
-        }
-        dst[i] = (uint8_t)((hi << 4) | lo);
-    }
-
-    return true;
-}
-
-static void flip_bitmap_vertically_inplace(uint8_t *bitmap, size_t bitmap_len)
-{
-    uint8_t rotated[QUERY_DISPLAY_BITMAP_BYTES];
-    const size_t row_bytes = UI_EPAPER_WIDTH / 8U;
-
-    if (bitmap == NULL || bitmap_len != sizeof(rotated)) {
-        return;
-    }
-
-    for (size_t y = 0; y < UI_EPAPER_HEIGHT; ++y) {
-        for (size_t xb = 0; xb < row_bytes; ++xb) {
-            size_t dst_index = (y * row_bytes) + xb;
-            size_t src_index = ((UI_EPAPER_HEIGHT - 1U - y) * row_bytes) + xb;
-            rotated[dst_index] = bitmap[src_index];
-        }
-    }
-
-    memcpy(bitmap, rotated, sizeof(rotated));
-}
-
-static void copy_json_string(cJSON *parent, const char *key, char *dst, size_t dst_size)
-{
-    cJSON *item = cJSON_GetObjectItemCaseSensitive(parent, key);
-
-    if (dst_size == 0U) {
-        return;
-    }
-    dst[0] = '\0';
-
-    if (cJSON_IsString(item) && item->valuestring != NULL) {
-        strlcpy(dst, item->valuestring, dst_size);
-    }
-}
-
-static esp_err_t parse_query_response(const char *response_body, query_result_t *result)
+static esp_err_t parse_whisper_response(const char *response_body, query_result_t *result)
 {
     cJSON *root;
-    cJSON *display_lines;
-    cJSON *display_bitmap_hex;
-    cJSON *line;
-    size_t line_index = 0;
+    cJSON *text;
 
     clear_query_result(result);
 
     root = cJSON_Parse(response_body);
     if (root == NULL) {
-        ESP_LOGE(TAG, "failed to parse query JSON");
+        ESP_LOGE(TAG, "failed to parse Whisper JSON");
         return ESP_FAIL;
     }
 
-    copy_json_string(root, "request_id", result->request_id, sizeof(result->request_id));
-    copy_json_string(root, "transcript", result->transcript, sizeof(result->transcript));
-    copy_json_string(root, "reply_text", result->reply_text, sizeof(result->reply_text));
-
-    display_lines = cJSON_GetObjectItemCaseSensitive(root, "display_lines");
-    if (cJSON_IsArray(display_lines)) {
-        cJSON_ArrayForEach(line, display_lines) {
-            if (!cJSON_IsString(line) || line->valuestring == NULL) {
-                continue;
-            }
-            if (line_index >= QUERY_DISPLAY_LINE_MAX) {
-                break;
-            }
-            strlcpy(result->display_lines[line_index],
-                    line->valuestring,
-                    sizeof(result->display_lines[line_index]));
-            line_index++;
-        }
+    text = cJSON_GetObjectItemCaseSensitive(root, "text");
+    if (!cJSON_IsString(text) || text->valuestring == NULL) {
+        text = cJSON_GetObjectItemCaseSensitive(root, "transcription");
+    }
+    if (!cJSON_IsString(text) || text->valuestring == NULL || text->valuestring[0] == '\0') {
+        ESP_LOGE(TAG, "Whisper JSON missing text/transcription");
+        cJSON_Delete(root);
+        return ESP_FAIL;
     }
 
-    display_bitmap_hex = cJSON_GetObjectItemCaseSensitive(root, "display_bitmap_hex");
-    if (cJSON_IsString(display_bitmap_hex) && display_bitmap_hex->valuestring != NULL &&
-        display_bitmap_hex->valuestring[0] != '\0') {
-        if (decode_hex_bitmap(display_bitmap_hex->valuestring,
-                              result->display_bitmap,
-                              sizeof(result->display_bitmap))) {
-            flip_bitmap_vertically_inplace(result->display_bitmap, sizeof(result->display_bitmap));
-            result->has_display_bitmap = true;
-        } else {
-            ESP_LOGW(TAG, "query display_bitmap_hex invalid; falling back to ASCII text");
-        }
-    }
+    strlcpy(result->transcript, text->valuestring, sizeof(result->transcript));
+    strlcpy(result->reply_text, result->transcript, sizeof(result->reply_text));
+    strlcpy(result->display_lines[0], result->transcript, sizeof(result->display_lines[0]));
+    result->display_line_count = 1U;
 
-    result->display_line_count = line_index;
     cJSON_Delete(root);
-
-    if (result->reply_text[0] == '\0' && result->transcript[0] == '\0') {
-        ESP_LOGE(TAG, "query JSON missing transcript and reply_text");
-        return ESP_FAIL;
-    }
-
     return ESP_OK;
 }
 
@@ -1168,18 +1142,18 @@ static size_t append_form_field(uint8_t *dst,
     return offset + (size_t)written;
 }
 
-static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
-                                                   const uint8_t *wav_bytes,
-                                                   size_t wav_size,
-                                                   uint8_t **body_out,
-                                                   size_t *body_len_out,
-                                                   char *content_type,
-                                                   size_t content_type_len)
+static esp_err_t build_whisper_multipart_body(const runtime_config_t *cfg,
+                                              const uint8_t *wav_bytes,
+                                              size_t wav_size,
+                                              uint8_t **body_out,
+                                              size_t *body_len_out,
+                                              char *content_type,
+                                              size_t content_type_len)
 {
     static const char file_header_template[] =
         "--" MULTIPART_BOUNDARY "\r\n"
-        "Content-Disposition: form-data; name=\"audio\"; filename=\"recording.wav\"\r\n"
-        "Content-Type: audio/wav\r\n\r\n";
+        "Content-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\n"
+        "Content-Type: application/octet-stream\r\n\r\n";
     static const char closing_template[] = "\r\n--" MULTIPART_BOUNDARY "--\r\n";
     size_t capacity;
     size_t offset = 0;
@@ -1189,23 +1163,20 @@ static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
         return ESP_ERR_INVALID_SIZE;
     }
 
-    capacity = wav_size + 4096U;
+    if (cfg == NULL || cfg->whisper_api_url[0] == '\0' || cfg->stt_model[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    capacity = wav_size + 2048U;
     body = malloc(capacity);
     if (body == NULL) {
         return ESP_ERR_NO_MEM;
     }
 
-    offset = append_form_field(body, capacity, offset, "device_id", cfg->device_id);
-    offset = append_form_field(body, capacity, offset, "firmware_version", cfg->firmware_version);
-    offset = append_form_field(body, capacity, offset, "session_id", "button-recording");
+    offset = append_form_field(body, capacity, offset, "model", cfg->stt_model);
     offset = append_form_field(body, capacity, offset, "language", cfg->language);
-    offset = append_form_field(body, capacity, offset, "audio_format", "wav");
-    {
-        char rec_ms[16];
-
-        snprintf(rec_ms, sizeof(rec_ms), "%" PRIu32, cfg->recording_duration_ms);
-        offset = append_form_field(body, capacity, offset, "recording_duration_ms", rec_ms);
-    }
+    offset = append_form_field(body, capacity, offset, "response_format", "json");
+    offset = append_form_field(body, capacity, offset, "temperature", "0");
     if (offset == 0U) {
         free(body);
         return ESP_ERR_INVALID_SIZE;
@@ -1239,7 +1210,7 @@ static esp_err_t build_audio_upload_multipart_body(const runtime_config_t *cfg,
     return ESP_OK;
 }
 
-/* Upload an already-captured WAV buffer to /v1/query and parse the response.
+/* Upload an already-captured WAV buffer to a Whisper-compatible STT endpoint.
  * The caller still owns wav_bytes (we only read it). */
 static esp_err_t upload_wav_and_parse(const runtime_config_t *cfg,
                                       const uint8_t *wav_bytes,
@@ -1262,29 +1233,30 @@ static esp_err_t upload_wav_and_parse(const runtime_config_t *cfg,
         return ESP_ERR_NO_MEM;
     }
 
-    err = build_audio_upload_multipart_body(
+    err = build_whisper_multipart_body(
         cfg, wav_bytes, wav_size, &body, &body_len, content_type, sizeof(content_type));
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "failed to build wav upload body: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "failed to build Whisper multipart body: %s", esp_err_to_name(err));
         goto cleanup;
     }
 
     err = perform_http_request(cfg,
-                               "/v1/query",
+                               cfg->whisper_api_url,
                                HTTP_METHOD_POST,
                                content_type,
+                               cfg->whisper_api_key,
                                body,
                                body_len,
                                response_buf,
                                QUERY_RESPONSE_BUFFER_SIZE,
                                &status);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "wav upload request failed status=%d err=%s",
+        ESP_LOGE(TAG, "Whisper upload request failed status=%d err=%s",
                  status, esp_err_to_name(err));
         goto cleanup;
     }
 
-    err = parse_query_response(response_buf, result);
+    err = parse_whisper_response(response_buf, result);
 
 cleanup:
     free(body);
@@ -1304,13 +1276,14 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "margin:40px auto;padding:0 16px;}input{width:100%%;padding:10px;margin:8px 0 16px;"
         "box-sizing:border-box;}button{padding:12px 16px;}code{background:#f4f4f4;padding:2px 4px;}"
         "</style></head><body><h1>Vibe Box Provisioning</h1>"
-        "<p>Connect the device to your Wi-Fi and thin server, then submit the form. "
+        "<p>Connect the device to your Wi-Fi and Whisper-compatible STT endpoint, then submit the form. "
         "After saving, the device will leave <code>%s</code> and try to connect.</p>"
         "<form method='post' action='/configure'>"
         "<label>Wi-Fi SSID</label><input name='wifi_ssid' value='%s' maxlength='32' />"
         "<label>Wi-Fi Password</label><input name='wifi_password' type='password' value='%s' maxlength='64' />"
-        "<label>Server Base URL</label><input name='server_base_url' value='%s' maxlength='191' />"
-        "<label>API Token</label><input name='api_token' type='password' value='%s' maxlength='191' />"
+        "<label>Whisper API URL</label><input name='whisper_api_url' value='%s' maxlength='255' />"
+        "<label>Whisper API Key</label><input name='whisper_api_key' type='password' value='%s' maxlength='255' />"
+        "<label>STT Model</label><input name='stt_model' value='%s' maxlength='95' />"
         "<label>Device ID</label><input name='device_id' value='%s' maxlength='63' />"
         "<label>Firmware Version</label><input name='firmware_version' value='%s' maxlength='63' />"
         "<label>Language</label><input name='language' value='%s' maxlength='15' />"
@@ -1320,8 +1293,9 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         app_state_name(APP_STATE_PROVISIONING),
         s_runtime_config.wifi_ssid,
         s_runtime_config.wifi_password,
-        s_runtime_config.server_base_url,
-        s_runtime_config.api_token,
+        s_runtime_config.whisper_api_url,
+        s_runtime_config.whisper_api_key,
+        s_runtime_config.stt_model,
         s_runtime_config.device_id,
         s_runtime_config.firmware_version,
         s_runtime_config.language,
@@ -1338,13 +1312,15 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
 
     snprintf(payload,
              sizeof(payload),
-             "{\"state\":\"%s\",\"wifi_ssid\":\"%s\",\"server_base_url\":\"%s\","
-             "\"api_token_configured\":%s,\"device_id\":\"%s\",\"firmware_version\":\"%s\","
+             "{\"state\":\"%s\",\"wifi_ssid\":\"%s\",\"whisper_api_url\":\"%s\","
+             "\"whisper_api_key_configured\":%s,\"stt_model\":\"%s\","
+             "\"device_id\":\"%s\",\"firmware_version\":\"%s\","
              "\"language\":\"%s\",\"recording_duration_ms\":%" PRIu32 "}",
              app_state_name(APP_STATE_PROVISIONING),
              s_runtime_config.wifi_ssid,
-             s_runtime_config.server_base_url,
-             s_runtime_config.api_token[0] ? "true" : "false",
+             s_runtime_config.whisper_api_url,
+             s_runtime_config.whisper_api_key[0] ? "true" : "false",
+             s_runtime_config.stt_model,
              s_runtime_config.device_id,
              s_runtime_config.firmware_version,
              s_runtime_config.language,
@@ -1387,10 +1363,14 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
                        next_config.wifi_password,
                        sizeof(next_config.wifi_password));
     extract_form_value(body,
-                       "server_base_url",
-                       next_config.server_base_url,
-                       sizeof(next_config.server_base_url));
-    extract_form_value(body, "api_token", next_config.api_token, sizeof(next_config.api_token));
+                       "whisper_api_url",
+                       next_config.whisper_api_url,
+                       sizeof(next_config.whisper_api_url));
+    extract_form_value(body,
+                       "whisper_api_key",
+                       next_config.whisper_api_key,
+                       sizeof(next_config.whisper_api_key));
+    extract_form_value(body, "stt_model", next_config.stt_model, sizeof(next_config.stt_model));
     extract_form_value(body, "device_id", next_config.device_id, sizeof(next_config.device_id));
     extract_form_value(body,
                        "firmware_version",
@@ -1402,7 +1382,7 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
     if (!runtime_config_is_complete(&next_config)) {
         httpd_resp_send_err(req,
                             HTTPD_400_BAD_REQUEST,
-                            "wifi_ssid and server_base_url are required");
+                            "wifi_ssid and whisper_api_url are required");
         return ESP_FAIL;
     }
 
@@ -1414,6 +1394,9 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
     }
     if (next_config.language[0] == '\0') {
         strlcpy(next_config.language, "zh", sizeof(next_config.language));
+    }
+    if (next_config.stt_model[0] == '\0') {
+        strlcpy(next_config.stt_model, VIBE_BOX_DEFAULT_STT_MODEL, sizeof(next_config.stt_model));
     }
     if (next_config.recording_duration_ms == 0U) {
         next_config.recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
@@ -1707,6 +1690,36 @@ static esp_err_t record_button_init(void)
     return gpio_config(&cfg);
 }
 
+static esp_err_t pwr_button_init(void)
+{
+    if (VIBE_BOX_PWR_BUTTON_GPIO < 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << VIBE_BOX_PWR_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    return gpio_config(&cfg);
+}
+
+static void handle_pwr_double_click(void)
+{
+    ESP_LOGI(TAG, "PWR double click detected; reinitializing BLE");
+    render_ui_status(APP_STATE_IDLE, "BLE", "resetting");
+
+    esp_err_t err = ble_keyboard_reinitialize();
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        render_ui_status(APP_STATE_IDLE, "BLE", "waiting connection");
+    } else {
+        ESP_LOGW(TAG, "ble_keyboard_reinitialize failed: %s", esp_err_to_name(err));
+        render_ui_status(APP_STATE_ERROR, "BLE", esp_err_to_name(err));
+    }
+}
+
 static void handle_press_and_hold_recording(void)
 {
     if (audio_input_recording_is_active()) {
@@ -1795,6 +1808,17 @@ static void handle_press_release_and_upload(void)
 
     if (err == ESP_OK) {
         log_query_result(&s_last_query_result);
+        const char *text_to_input = s_last_query_result.transcript[0] != '\0'
+                                        ? s_last_query_result.transcript
+                                        : s_last_query_result.reply_text;
+        esp_err_t ble_err = ble_keyboard_notify_text(text_to_input);
+        if (ble_err == ESP_OK) {
+            ESP_LOGI(TAG, "sent transcript to BLE text input");
+        } else if (ble_err == ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "BLE text input client not ready");
+        } else {
+            ESP_LOGW(TAG, "BLE text input notify failed: %s", esp_err_to_name(ble_err));
+        }
         render_ui_query_result(&s_last_query_result);
         render_ui_status(APP_STATE_IDLE, "Idle", "ready for next take");
     } else {
@@ -1848,6 +1872,61 @@ static void audio_button_task(void *arg)
     }
 }
 
+static void pwr_button_task(void *arg)
+{
+    (void)arg;
+
+    esp_err_t err = pwr_button_init();
+    if (err == ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "PWR button disabled");
+        vTaskDelete(NULL);
+        return;
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "failed to init PWR button GPIO%d: %s",
+                 VIBE_BOX_PWR_BUTTON_GPIO, esp_err_to_name(err));
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "PWR double-click BLE reset ready on GPIO%d (active low)",
+             VIBE_BOX_PWR_BUTTON_GPIO);
+
+    int stable_level = 1;
+    int candidate_level = 1;
+    int candidate_count = 0;
+    uint32_t last_release_ms = 0;
+
+    while (true) {
+        int level = gpio_get_level(VIBE_BOX_PWR_BUTTON_GPIO);
+        if (level == candidate_level) {
+            if (candidate_count < VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES) {
+                candidate_count++;
+            }
+        } else {
+            candidate_level = level;
+            candidate_count = 1;
+        }
+
+        if (candidate_count >= VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES &&
+            candidate_level != stable_level) {
+            stable_level = candidate_level;
+            if (stable_level != 0) {
+                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                if (last_release_ms != 0U &&
+                    now_ms - last_release_ms <= (uint32_t)VIBE_BOX_PWR_DOUBLE_CLICK_MS) {
+                    last_release_ms = 0;
+                    handle_pwr_double_click();
+                } else {
+                    last_release_ms = now_ms;
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(VIBE_BOX_BUTTON_POLL_MS));
+    }
+}
+
 void app_main(void)
 {
     app_state_t state = APP_STATE_BOOT;
@@ -1878,6 +1957,11 @@ void app_main(void)
     ESP_ERROR_CHECK(storage_load_runtime_config(&s_runtime_config, &loaded_from_nvs));
     log_runtime_config(&s_runtime_config, loaded_from_nvs ? "nvs+defaults" : "menuconfig-defaults");
 
+    esp_err_t ble_err = ble_keyboard_init();
+    if (ble_err != ESP_OK) {
+        ESP_LOGE(TAG, "ble_keyboard_init failed: %s", esp_err_to_name(ble_err));
+    }
+
     if (VIBE_BOX_ENABLE_I2S_CAPTURE) {
         esp_err_t err = prepare_audio_capture_pipeline(&s_runtime_config);
         if (err != ESP_OK) {
@@ -1904,6 +1988,11 @@ void app_main(void)
         ESP_LOGE(TAG, "failed to create audio_button_task");
     }
 
+    if (xTaskCreatePinnedToCore(pwr_button_task, "pwr_btn", 4096, NULL, 5, NULL,
+                                tskNO_AFFINITY) != pdPASS) {
+        ESP_LOGE(TAG, "failed to create pwr_button_task");
+    }
+
     while (true) {
         if (state == APP_STATE_IDLE) {
             esp_err_t err;
@@ -1922,15 +2011,15 @@ void app_main(void)
                 continue;
             }
 
-            set_state(&state, APP_STATE_UPLOADING, "starting /health probe");
-            render_ui_status(state, "Uploading", "checking /health");
+            set_state(&state, APP_STATE_UPLOADING, "starting network readiness check");
+            render_ui_status(state, "Uploading", "checking network");
             err = health_check_once(&s_runtime_config);
             if (err == ESP_OK) {
-                set_state(&state, APP_STATE_IDLE, "/health probe succeeded");
-                render_ui_status(state, "Idle", "health ok");
+                set_state(&state, APP_STATE_IDLE, "network readiness check succeeded");
+                render_ui_status(state, "Idle", "network ok");
             } else {
-                set_state(&state, APP_STATE_ERROR, "/health probe failed");
-                render_ui_status(state, "Error", "health failed");
+                set_state(&state, APP_STATE_ERROR, "network readiness check failed");
+                render_ui_status(state, "Error", "network failed");
             }
         } else if (state == APP_STATE_PROVISIONING) {
             ESP_LOGI(TAG,
@@ -1963,7 +2052,7 @@ void app_main(void)
                 } else if (connect_using_runtime_config(&state, "recovered wifi connection") !=
                            ESP_OK) {
                     ESP_LOGW(TAG,
-                             "error hint: verify Wi-Fi, server URL, and /v1/query or /health response");
+                             "error hint: verify Wi-Fi and Whisper-compatible API URL");
                     render_ui_status(state, "Error", "waiting before reconnect retry");
                 }
             }

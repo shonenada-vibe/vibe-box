@@ -7,6 +7,10 @@
 - 设备端 `ESP-IDF` 工程已建立并可稳定编译
 - 板子已可独立连接 `Wi-Fi`
 - 设备已可通过 `HTTP POST /v1/query` 向薄服务端发送请求
+- 设备已可绕过薄服务端，直接向 Whisper-compatible STT endpoint 上传 WAV 并解析转写文本
+- 设备已启动 BLE，名称为 `VibeBox`，并提供 BLE HID keyboard 与文本通知服务
+- 设备已支持快速双击 `PWR` 重新等待 BLE 连接
+- Mac 端已增加只负责文字输入的 BLE 辅助脚本
 - 设备已可接收并解析服务端 JSON 响应
 - 已完成 `SoftAP + Web` 首次配网与 `NVS` 持久化
 - 已完成 demo 文本请求与 demo 音频上传链路
@@ -57,6 +61,9 @@
 - 建立 `audio_input` 组件：
   - `firmware/components/audio_input/audio_input.c`
   - `firmware/components/audio_input/audio_input.h`
+- 建立 `ble_keyboard` 组件：
+  - `firmware/components/ble_keyboard/ble_keyboard.c`
+  - `firmware/components/ble_keyboard/ble_keyboard.h`
 
 当前实现细节：
 
@@ -80,8 +87,9 @@
 
 - `Wi-Fi SSID`
 - `Wi-Fi password`
-- `Server base URL`
-- `API token`
+- `Whisper API URL`
+- `Whisper API key`
+- `STT model`
 - `Device ID`
 - `Firmware version`
 - `Language`
@@ -210,12 +218,32 @@
 - 已成功向服务端发起 `/v1/query`
 - 已收到 `200` 响应并完成 body 累计逻辑修复
 - 最新固件已具备完整请求闭环能力，正在继续做最终实机验证
+- 转写成功后会通过 BLE text notify 发送给 Mac 端脚本，由脚本粘贴到当前激活应用
 
 未完成：
 
 - TLS 证书校验
 - 更细粒度的断网恢复与请求恢复
 - 墨水屏真实显示结果
+
+### Phase 6: 蓝牙输入
+
+已完成：
+
+- 固件启动 BLE，广播设备名 `VibeBox`
+- 固件注册 BLE HID keyboard report map，可作为键盘类设备连接
+- 固件注册自定义文本 notify characteristic：
+  - service UUID: `48f2d101-7a15-4b3f-8d67-60587f5d1001`
+  - char UUID: `48f2d101-7a15-4b3f-8d67-60587f5d1002`
+- 上传 Whisper-compatible STT 成功后，固件把 transcript 分片推送到文本 characteristic
+- `host/vibebox_text_input.py` 扫描并连接 `VibeBox`，订阅文本通知后用 macOS AppleScript 粘贴文本
+- 快速双击 `PWR` 会清理 BLE 文本连接状态、重新广播 `VibeBox` 并等待重新连接
+
+待验证：
+
+- macOS 首次配对流程
+- HID 连接与 Python GATT 订阅同时工作时的稳定性
+- PWR 双击重置 BLE 后 macOS 自动重连表现
 
 ### Phase 6: 墨水屏体验优化
 

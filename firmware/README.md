@@ -5,12 +5,14 @@
 当前阶段：
 
 - 建立最小 `ESP-IDF` 工程骨架
-- 已打通 `Wi-Fi STA + NVS + SoftAP 配网 + /health | /v1/query` 的可编译底座
+- 已打通 `Wi-Fi STA + NVS + SoftAP 配网 + Whisper-compatible STT` 的可编译底座
+- 已增加 BLE HID keyboard，设备名为 `VibeBox`
 - 后续逐步接入：
   - 墨水屏
   - 音频采集
   - 传感器
-  - `/v1/query` 请求
+  - Whisper-compatible `/audio/transcriptions` 请求
+  - BLE 文本输入辅助脚本
 
 ## 预期结构
 
@@ -35,8 +37,9 @@ firmware/
   - `Wi-Fi password`
   - `Provisioning AP SSID`
   - `Provisioning AP password`
-  - `Server base URL`
-  - `API token`
+  - `Whisper-compatible API URL`
+  - `Whisper-compatible API key`
+  - `STT model`
   - `Device ID`
   - `Firmware version`
   - `Language`
@@ -48,8 +51,9 @@ firmware/
 - 启动时会优先从 `NVS` 读取运行时配置：
   - `wifi_ssid`
   - `wifi_password`
-  - `server_base_url`
-  - `api_token`
+  - `whisper_api_url`
+  - `whisper_api_key`
+  - `stt_model`
   - `device_id`
   - `firmware_version`
   - `language`
@@ -60,9 +64,31 @@ firmware/
   - 提交表单后写入 `NVS` 并自动切回 `STA`
 - 若已有完整配置，启动后会：
   - 连接 Wi-Fi
-  - 周期性请求 `GET {server_base_url}/health`
-  - 用户按住 `BOOT` 键录音，松手后上传真实 `WAV`
+  - 启动 BLE 并以 `VibeBox` 广播为键盘
+  - 周期性检查 Wi-Fi 连接状态
+  - 用户按住 `BOOT` 键录音，松手后把真实 `WAV` 直接发到 Whisper-compatible STT
+  - 若 Mac 端 `host/vibebox_text_input.py` 已连接并订阅文本通知，会把转写文本粘贴到当前激活应用
   - 用日志打印状态、请求内容、响应内容和解析结果
+
+## 蓝牙文字输入
+
+- 固件启动后会开启 BLE，广播名称为 `VibeBox`
+- 系统蓝牙里连接后会显示为键盘类 HID 设备
+- 任意 Unicode 文本输入通过自定义 BLE notify characteristic 交给 Mac 端脚本执行粘贴：
+- 快速双击板载 `PWR` 键会重置 BLE 会话状态并重新广播，等待主机重新连接
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r host/requirements.txt
+python host/vibebox_text_input.py
+```
+
+可选参数：
+
+- `--press-return`：粘贴后自动按回车
+- `--once`：连接断开后退出
+- `--verbose`：输出 BLE 调试日志
 
 ## 真实音频采集
 
@@ -81,8 +107,8 @@ firmware/
 3. 打开 `http://192.168.4.1/`
 4. 填写：
    - 家里 Wi‑Fi 的 `SSID / password`
-   - `Server Base URL`
-   - 可选 `API Token / Device ID / Firmware Version`
+   - `Whisper API URL`
+   - 可选 `Whisper API Key / STT Model / Device ID / Firmware Version`
    - `Language / Recording Duration`
 5. 提交后设备保存配置并自动尝试连回目标 Wi‑Fi
 
