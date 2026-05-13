@@ -2464,13 +2464,8 @@ void app_main(void)
                 continue;
             }
 
-            set_state(&state, APP_STATE_UPLOADING, "starting network readiness check");
-            render_ui_status(state, "Uploading", "checking network");
             err = health_check_once(&s_runtime_config);
-            if (err == ESP_OK) {
-                set_state(&state, APP_STATE_IDLE, "network readiness check succeeded");
-                render_ui_status(state, "Idle", "network ok");
-            } else {
+            if (err != ESP_OK) {
                 set_state(&state, APP_STATE_ERROR, "network readiness check failed");
                 render_ui_status(state, "Error", "network failed");
             }
