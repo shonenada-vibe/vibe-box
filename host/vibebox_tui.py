@@ -111,7 +111,7 @@ class DeviceConfig:
     language: str = "zh"
     recording_duration_ms: int = 3000
 
-    def as_form(self) -> dict[str, str]:
+    def as_ble_payload(self) -> dict[str, str | int]:
         return {
             "wifi_ssid": self.wifi_ssid,
             "wifi_password": self.wifi_password,
@@ -121,7 +121,7 @@ class DeviceConfig:
             "device_id": self.device_id,
             "firmware_version": self.firmware_version,
             "language": self.language,
-            "recording_duration_ms": str(self.recording_duration_ms),
+            "recording_duration_ms": self.recording_duration_ms,
         }
 
 
@@ -440,7 +440,7 @@ async def paste_text(state: TuiState, text: str) -> None:
 
 def config_packets_for_save(cfg: DeviceConfig) -> list[bytes]:
     validate_device_config(cfg)
-    payload = json.dumps(cfg.as_form(), separators=(",", ":")).encode("utf-8")
+    payload = json.dumps(cfg.as_ble_payload(), separators=(",", ":")).encode("utf-8")
     packets = [bytes([CONFIG_OPCODE_SAVE_BEGIN])]
     for idx in range(0, len(payload), BLE_PACKET_PAYLOAD_MAX):
         packets.append(bytes([CONFIG_OPCODE_SAVE_CHUNK]) + payload[idx : idx + BLE_PACKET_PAYLOAD_MAX])
