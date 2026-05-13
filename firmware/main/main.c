@@ -680,12 +680,25 @@ static esp_err_t runtime_config_update_from_json(const char *json, runtime_confi
 
     rec_ms = cJSON_GetObjectItemCaseSensitive(root, "recording_duration_ms");
     if (rec_ms != NULL) {
-        if (!cJSON_IsNumber(rec_ms) || rec_ms->valuedouble < 1000.0 ||
-            rec_ms->valuedouble > 15000.0) {
+        if (cJSON_IsNumber(rec_ms)) {
+            if (rec_ms->valuedouble < 1000.0 || rec_ms->valuedouble > 15000.0) {
+                err = ESP_ERR_INVALID_ARG;
+                goto cleanup;
+            }
+            next_config->recording_duration_ms = (uint32_t)rec_ms->valuedouble;
+        } else if (cJSON_IsString(rec_ms) && rec_ms->valuestring != NULL) {
+            char *end = NULL;
+            unsigned long parsed = strtoul(rec_ms->valuestring, &end, 10);
+
+            if (end == NULL || *end != '\0' || parsed < 1000UL || parsed > 15000UL) {
+                err = ESP_ERR_INVALID_ARG;
+                goto cleanup;
+            }
+            next_config->recording_duration_ms = (uint32_t)parsed;
+        } else {
             err = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        next_config->recording_duration_ms = (uint32_t)rec_ms->valuedouble;
     }
 
     fill_runtime_config_defaults(next_config);
