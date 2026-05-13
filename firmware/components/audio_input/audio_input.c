@@ -336,13 +336,21 @@ esp_err_t audio_input_prepare_i2s_capture(const audio_input_i2s_config_t *cfg)
     }
 
     if (s_i2c_bus_handle == NULL) {
-        bus_cfg.i2c_port = cfg->i2c_port;
-        bus_cfg.sda_io_num = cfg->i2c_sda_gpio;
-        bus_cfg.scl_io_num = cfg->i2c_scl_gpio;
-        bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
-        bus_cfg.glitch_ignore_cnt = 7;
-        bus_cfg.flags.enable_internal_pullup = true;
-        ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_i2c_bus_handle), TAG, "i2c bus init failed");
+        /* Another module (e.g. touch_input) may have already created this I2C
+         * port. Reuse it instead of registering a duplicate bus. */
+        esp_err_t get_err = i2c_master_get_bus_handle(cfg->i2c_port, &s_i2c_bus_handle);
+        if (get_err != ESP_OK || s_i2c_bus_handle == NULL) {
+            s_i2c_bus_handle = NULL;
+            bus_cfg.i2c_port = cfg->i2c_port;
+            bus_cfg.sda_io_num = cfg->i2c_sda_gpio;
+            bus_cfg.scl_io_num = cfg->i2c_scl_gpio;
+            bus_cfg.clk_source = I2C_CLK_SRC_DEFAULT;
+            bus_cfg.glitch_ignore_cnt = 7;
+            bus_cfg.flags.enable_internal_pullup = true;
+            ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bus_cfg, &s_i2c_bus_handle), TAG, "i2c bus init failed");
+        } else {
+            ESP_LOGI(TAG, "reusing existing I2C bus on port %d", cfg->i2c_port);
+        }
     }
 
     if (s_codec_dev_handle == NULL) {
