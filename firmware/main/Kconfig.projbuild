@@ -84,13 +84,6 @@ config VIBE_BOX_RECORDING_DURATION_MS
     help
         Target recording duration for microphone capture and upload.
 
-config VIBE_BOX_HEALTH_POLL_INTERVAL_MS
-    int "Network readiness check interval (ms)"
-    range 1000 600000
-    default 10000
-    help
-        Interval used to check Wi-Fi readiness while idle.
-
 config VIBE_BOX_PWR_BUTTON_GPIO
     int "PWR button GPIO"
     range -1 48
