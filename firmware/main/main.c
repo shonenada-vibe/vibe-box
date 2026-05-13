@@ -319,6 +319,7 @@ static ui_snapshot_t s_ui_snapshot;
 static uint32_t s_press_start_ms;
 static uint32_t s_touch_press_start_ms;
 static uint32_t s_touch_last_tap_release_ms;
+static volatile bool s_touch_recording_started;
 static TaskHandle_t s_ui_dashboard_task_handle;
 
 static const char *app_state_name(app_state_t state)
@@ -2059,11 +2060,11 @@ static void confirm_power_on_long_press(void)
     ESP_LOGI(TAG, "PWR long-press confirmed; powering on");
 }
 
-static void handle_press_and_hold_recording(void)
+static bool handle_press_and_hold_recording(void)
 {
     if (audio_input_recording_is_active()) {
         ESP_LOGW(TAG, "press detected while recording already active; ignoring");
-        return;
+        return false;
     }
 
     audio_input_i2s_config_t capture_cfg = {
@@ -2088,11 +2089,12 @@ static void handle_press_and_hold_recording(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "audio_input_recording_start failed: %s", esp_err_to_name(err));
         render_ui_status(APP_STATE_ERROR, "Recording", "mic init failed");
-        return;
+        return false;
     }
 
     s_press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
     render_ui_status(APP_STATE_RECORDING, "Recording", "release to send");
+    return true;
 }
 
 static void handle_press_release_and_upload(void)
@@ -2190,22 +2192,53 @@ static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
     }
 }
 
+static void touch_hold_recording_task(void *arg)
+{
+    uint32_t press_start_ms = (uint32_t)(uintptr_t)arg;
+
+    vTaskDelay(pdMS_TO_TICKS(VIBE_BOX_TOUCH_TAP_MAX_MS + VIBE_BOX_TOUCH_POLL_MS));
+
+    if (s_touch_press_start_ms == press_start_ms && touch_input_is_pressed()) {
+        ESP_LOGI(TAG, "touch hold detected; starting recording");
+        s_touch_recording_started = handle_press_and_hold_recording();
+    }
+
+    vTaskDelete(NULL);
+}
+
 static void on_touch_event(touch_event_t event, void *user_ctx)
 {
     (void)user_ctx;
     if (event == TOUCH_EVENT_DOWN) {
         ESP_LOGI(TAG, "touch down");
         s_touch_press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        handle_press_and_hold_recording();
+        s_touch_recording_started = false;
+        BaseType_t ok = xTaskCreatePinnedToCore(
+            touch_hold_recording_task,
+            "touch_hold",
+            4096,
+            (void *)(uintptr_t)s_touch_press_start_ms,
+            5,
+            NULL,
+            tskNO_AFFINITY);
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "failed to create touch hold task");
+        }
     } else {
         ESP_LOGI(TAG, "touch up");
         uint32_t release_ms = (uint32_t)(esp_timer_get_time() / 1000);
         uint32_t held_ms = s_touch_press_start_ms != 0U
                                ? release_ms - s_touch_press_start_ms
                                : 0U;
+        bool touch_recording_started = s_touch_recording_started;
         s_touch_press_start_ms = 0;
-        handle_press_release_and_upload();
-        handle_touch_tap_enter(release_ms, held_ms);
+        s_touch_recording_started = false;
+        if (touch_recording_started) {
+            s_touch_last_tap_release_ms = 0;
+            handle_press_release_and_upload();
+        } else {
+            handle_touch_tap_enter(release_ms, held_ms);
+        }
     }
 }
 
