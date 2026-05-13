@@ -24,6 +24,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
+#include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
@@ -126,6 +127,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_PWR_DOUBLE_CLICK_MS CONFIG_VIBE_BOX_PWR_DOUBLE_CLICK_MS
 #else
 #define VIBE_BOX_PWR_DOUBLE_CLICK_MS 500
+#endif
+
+#ifdef CONFIG_VIBE_BOX_PWR_LONG_PRESS_MS
+#define VIBE_BOX_PWR_LONG_PRESS_MS CONFIG_VIBE_BOX_PWR_LONG_PRESS_MS
+#else
+#define VIBE_BOX_PWR_LONG_PRESS_MS 5000
 #endif
 
 #ifdef CONFIG_VIBE_BOX_I2C_SDA_GPIO
@@ -1751,6 +1758,94 @@ static void handle_pwr_double_click(void)
     }
 }
 
+/* Render "Power off" on the e-paper (best-effort) and enter deep sleep with
+ * EXT1 wake-up armed on the PWR pin. Re-pressing PWR will boot the device,
+ * and the early boot path requires a long-press to confirm power-on. */
+static void enter_power_off(void)
+{
+    ESP_LOGI(TAG, "PWR long-press detected; powering off");
+
+    if (ui_epaper_is_ready()) {
+        (void)ui_epaper_show_status("Power off", "hold PWR to power on");
+    }
+
+    /* Wait for the user to release PWR before arming the wake source so we
+     * don't immediately re-trigger on a still-held press. */
+    if (VIBE_BOX_PWR_BUTTON_GPIO >= 0) {
+        const uint32_t release_timeout_ms = 10000U;
+        uint32_t waited = 0;
+        while (gpio_get_level(VIBE_BOX_PWR_BUTTON_GPIO) == 0 &&
+               waited < release_timeout_ms) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            waited += 50U;
+        }
+    }
+
+    /* PWR is active-low. Use EXT1 (any-low) wake on its bit. ESP32-S3 RTC IO
+     * range covers GPIO0..GPIO21 so the default GPIO18 is supported. */
+    if (VIBE_BOX_PWR_BUTTON_GPIO >= 0) {
+        const uint64_t mask = 1ULL << VIBE_BOX_PWR_BUTTON_GPIO;
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+        esp_err_t werr = esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_LOW);
+        if (werr != ESP_OK) {
+            ESP_LOGW(TAG, "ext1 wakeup arm failed: %s", esp_err_to_name(werr));
+        }
+#else
+        ESP_LOGW(TAG, "EXT1 wakeup not supported by SoC; device may not wake");
+#endif
+    }
+
+    ESP_LOGI(TAG, "entering deep sleep");
+    esp_deep_sleep_start();
+}
+
+/* If we just woke from EXT1 (PWR press), require the user to keep the button
+ * held for the full long-press window before continuing the boot. If they
+ * release early, re-arm wake-up and go back to deep sleep so the device only
+ * actually powers on after a confirmed long-press. */
+static void confirm_power_on_long_press(void)
+{
+    if (VIBE_BOX_PWR_BUTTON_GPIO < 0) {
+        return;
+    }
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    if (cause != ESP_SLEEP_WAKEUP_EXT1) {
+        return;
+    }
+
+    /* Make sure we can read the pin. The PWR GPIO might still be in its
+     * RTC-domain configuration from the previous deep sleep; reconfigure
+     * as a normal input with pull-up. */
+    gpio_config_t cfg = {
+        .pin_bit_mask = 1ULL << VIBE_BOX_PWR_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    (void)gpio_config(&cfg);
+
+    ESP_LOGI(TAG, "wake from PWR; waiting for %dms long-press to confirm power on",
+             VIBE_BOX_PWR_LONG_PRESS_MS);
+
+    const uint32_t target = (uint32_t)VIBE_BOX_PWR_LONG_PRESS_MS;
+    uint32_t held_ms = 0;
+    while (held_ms < target) {
+        if (gpio_get_level(VIBE_BOX_PWR_BUTTON_GPIO) != 0) {
+            ESP_LOGW(TAG, "PWR released after %ums; going back to sleep", (unsigned)held_ms);
+#if SOC_PM_SUPPORT_EXT1_WAKEUP
+            esp_sleep_enable_ext1_wakeup(1ULL << VIBE_BOX_PWR_BUTTON_GPIO,
+                                         ESP_EXT1_WAKEUP_ANY_LOW);
+#endif
+            esp_deep_sleep_start();
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+        held_ms += 50U;
+    }
+
+    ESP_LOGI(TAG, "PWR long-press confirmed; powering on");
+}
+
 static void handle_press_and_hold_recording(void)
 {
     if (audio_input_recording_is_active()) {
@@ -1932,13 +2027,15 @@ static void pwr_button_task(void *arg)
         return;
     }
 
-    ESP_LOGI(TAG, "PWR double-click BLE reset ready on GPIO%d (active low)",
-             VIBE_BOX_PWR_BUTTON_GPIO);
+    ESP_LOGI(TAG, "PWR ready on GPIO%d (active low): double-click=BLE reset, hold %dms=power off",
+             VIBE_BOX_PWR_BUTTON_GPIO, VIBE_BOX_PWR_LONG_PRESS_MS);
 
     int stable_level = 1;
     int candidate_level = 1;
     int candidate_count = 0;
     uint32_t last_release_ms = 0;
+    uint32_t press_start_ms = 0;
+    bool long_press_fired = false;
 
     while (true) {
         int level = gpio_get_level(VIBE_BOX_PWR_BUTTON_GPIO);
@@ -1954,15 +2051,39 @@ static void pwr_button_task(void *arg)
         if (candidate_count >= VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES &&
             candidate_level != stable_level) {
             stable_level = candidate_level;
-            if (stable_level != 0) {
-                uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-                if (last_release_ms != 0U &&
-                    now_ms - last_release_ms <= (uint32_t)VIBE_BOX_PWR_DOUBLE_CLICK_MS) {
-                    last_release_ms = 0;
-                    handle_pwr_double_click();
+            if (stable_level == 0) {
+                /* Press edge: start long-press timer. */
+                press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                long_press_fired = false;
+            } else {
+                /* Release edge: handle double-click only if no long-press
+                 * was already fired during this hold. */
+                press_start_ms = 0;
+                if (!long_press_fired) {
+                    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                    if (last_release_ms != 0U &&
+                        now_ms - last_release_ms <= (uint32_t)VIBE_BOX_PWR_DOUBLE_CLICK_MS) {
+                        last_release_ms = 0;
+                        handle_pwr_double_click();
+                    } else {
+                        last_release_ms = now_ms;
+                    }
                 } else {
-                    last_release_ms = now_ms;
+                    long_press_fired = false;
                 }
+            }
+        }
+
+        /* Continuous-hold detection: while the button is stably pressed,
+         * check whether we've crossed the long-press threshold. */
+        if (stable_level == 0 && !long_press_fired && press_start_ms != 0U) {
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if (now_ms - press_start_ms >= (uint32_t)VIBE_BOX_PWR_LONG_PRESS_MS) {
+                long_press_fired = true;
+                /* Cancel any pending double-click bookkeeping. */
+                last_release_ms = 0;
+                enter_power_off();
+                /* enter_power_off() does not return on success. */
             }
         }
 
@@ -1980,6 +2101,11 @@ void app_main(void)
     ESP_LOGI(TAG, "vibe-box starting");
     ESP_LOGI(TAG, "app_main entered");
     set_state(&state, APP_STATE_BOOT, "startup");
+
+    /* If we just woke from EXT1 (PWR press), require a confirmed long-press
+     * before continuing the boot. This runs before any heavy init so a
+     * spurious wake (button bounce, etc.) does not power up the device. */
+    confirm_power_on_long_press();
 
     {
         esp_err_t epd_err = ui_epaper_init();
