@@ -106,6 +106,15 @@ config VIBE_BOX_PWR_DOUBLE_CLICK_MS
     help
         Maximum interval between two PWR button releases to trigger BLE reinitialization.
 
+config VIBE_BOX_PWR_LONG_PRESS_MS
+    int "PWR long-press power-off / power-on duration (ms)"
+    range 1000 15000
+    default 3000
+    help
+        Hold the PWR button continuously for at least this long to power
+        the device off (when on) or to confirm a power-on (when waking
+        from deep sleep).
+
 config VIBE_BOX_ENABLE_I2S_CAPTURE
     bool "Enable I2S RX audio capture"
     default y
