@@ -333,3 +333,14 @@ bool touch_input_is_pressed(void)
 {
     return s_initialized && s_state.pressed;
 }
+
+bool touch_input_get_last_point(uint16_t *x, uint16_t *y)
+{
+    if (!s_initialized || x == NULL || y == NULL) {
+        return false;
+    }
+
+    *x = s_state.last_point.x;
+    *y = s_state.last_point.y;
+    return true;
+}

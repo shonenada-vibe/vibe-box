@@ -301,6 +301,9 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_TOUCH_HOLD_START_MS 180
 #endif
 
+#define TOUCH_CONFIG_BUTTON_TOP_Y        152U
+#define TOUCH_CONFIG_BUTTON_SPLIT_X      (UI_EPAPER_WIDTH / 2U)
+
 #ifdef CONFIG_VIBE_BOX_RECORDING_MAX_MS
 #define VIBE_BOX_RECORDING_MAX_MS CONFIG_VIBE_BOX_RECORDING_MAX_MS
 #else
@@ -340,7 +343,9 @@ typedef enum {
     APP_STATE_PROVISIONING,
     APP_STATE_IDLE,
     APP_STATE_RECORDING,
-    APP_STATE_UPLOADING,
+    APP_STATE_TRANSCRIPTING,
+    APP_STATE_TRANSLATING,
+    APP_STATE_REFINING,
     APP_STATE_DISPLAYING,
     APP_STATE_ERROR,
 } app_state_t;
@@ -409,6 +414,7 @@ static volatile bool s_touch_recording_started;
 static volatile bool s_touch_release_pending;
 static volatile bool s_touch_abort_pending;
 static bool s_touch_ignoring_current_press;
+static bool s_touch_config_mode;
 static TaskHandle_t s_ui_dashboard_task_handle;
 static adc_oneshot_unit_handle_t s_battery_adc_handle;
 static adc_cali_handle_t s_battery_adc_cali_handle;
@@ -426,8 +432,12 @@ static const char *app_state_name(app_state_t state)
         return "idle";
     case APP_STATE_RECORDING:
         return "recording";
-    case APP_STATE_UPLOADING:
-        return "uploading";
+    case APP_STATE_TRANSCRIPTING:
+        return "transcripting";
+    case APP_STATE_TRANSLATING:
+        return "translating";
+    case APP_STATE_REFINING:
+        return "refining";
     case APP_STATE_DISPLAYING:
         return "displaying";
     case APP_STATE_ERROR:
@@ -1664,6 +1674,13 @@ static void render_ui_status(app_state_t state, const char *headline, const char
     }
 }
 
+static void notify_ui_dashboard(void)
+{
+    if (s_ui_dashboard_task_handle != NULL) {
+        xTaskNotifyGive(s_ui_dashboard_task_handle);
+    }
+}
+
 static void render_ui_query_result(const query_result_t *result)
 {
     size_t i;
@@ -2616,9 +2633,55 @@ static esp_err_t prepare_audio_capture_pipeline(const runtime_config_t *cfg)
     return audio_input_prepare_i2s_capture(&capture_cfg);
 }
 
+static void ui_dashboard_render_config_mode(void)
+{
+    char line[UI_EPAPER_MAX_COLS + 1];
+    const int x = 4;
+    const int line_step = 10;
+    const int button_y = (int)TOUCH_CONFIG_BUTTON_TOP_Y;
+    const int button_bottom = UI_EPAPER_HEIGHT - 6;
+    const int button_gap = 4;
+    const int left_x0 = 4;
+    const int left_x1 = (UI_EPAPER_WIDTH / 2) - button_gap;
+    const int right_x0 = (UI_EPAPER_WIDTH / 2) + button_gap;
+    const int right_x1 = UI_EPAPER_WIDTH - 5;
+
+    ui_epaper_clear();
+    ui_epaper_draw_text(x, 4, "Config Mode");
+    ui_epaper_draw_hline(14, x, UI_EPAPER_WIDTH - x - 1);
+
+    snprintf(line,
+             sizeof(line),
+             "Translate: %s",
+             s_runtime_config.translation_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(x, 24, line);
+    snprintf(line, sizeof(line), "Refine: %s", s_runtime_config.refine_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(x, 24 + line_step, line);
+
+    ui_epaper_draw_text(x, 54, "Swipe exits");
+    ui_epaper_draw_text(x, 64, "Tap a bottom button");
+
+    ui_epaper_draw_rect(left_x0, button_y, left_x1, button_bottom);
+    ui_epaper_draw_rect(right_x0, button_y, right_x1, button_bottom);
+
+    snprintf(line, sizeof(line), "TR %s", s_runtime_config.translation_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(left_x0 + 8, button_y + 14, line);
+    snprintf(line, sizeof(line), "RF %s", s_runtime_config.refine_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(right_x0 + 8, button_y + 14, line);
+}
+
 static void ui_dashboard_render_once(void)
 {
     if (!ui_epaper_is_ready()) {
+        return;
+    }
+
+    if (s_touch_config_mode) {
+        ui_dashboard_render_config_mode();
+        esp_err_t err = ui_epaper_flush();
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "epaper config flush failed: %s", esp_err_to_name(err));
+        }
         return;
     }
 
@@ -3016,14 +3079,14 @@ static void handle_press_release_and_upload(record_owner_t owner)
 
     if (!wifi_is_connected()) {
         s_record_owner = RECORD_OWNER_NONE;
-        render_ui_status(APP_STATE_ERROR, "Upload", "wifi disconnected");
+        render_ui_status(APP_STATE_ERROR, "Transcript", "wifi disconnected");
         free(wav_buf);
         return;
     }
 
     char detail[64];
-    snprintf(detail, sizeof(detail), "uploading %" PRIu32 " ms", duration_ms);
-    render_ui_status(APP_STATE_UPLOADING, "Uploading", detail);
+    snprintf(detail, sizeof(detail), "audio %" PRIu32 " ms", duration_ms);
+    render_ui_status(APP_STATE_TRANSCRIPTING, "Transcripting", detail);
 
     err = upload_wav_and_parse(&s_runtime_config, wav_buf, wav_size, &s_last_query_result);
     free(wav_buf);
@@ -3035,14 +3098,14 @@ static void handle_press_release_and_upload(record_owner_t owner)
                      sizeof(translate_detail),
                      "to %.40s",
                      s_runtime_config.translation_target_language);
-            render_ui_status(APP_STATE_UPLOADING, "Translating", translate_detail);
+            render_ui_status(APP_STATE_TRANSLATING, "Translating", translate_detail);
             esp_err_t tr_err = translate_query_result(&s_runtime_config, &s_last_query_result);
             if (tr_err != ESP_OK) {
                 ESP_LOGW(TAG, "translation skipped/failed: %s", esp_err_to_name(tr_err));
             }
         }
         if (s_runtime_config.refine_enabled) {
-            render_ui_status(APP_STATE_UPLOADING, "Refining", "polishing text");
+            render_ui_status(APP_STATE_REFINING, "Refining", "polishing text");
             esp_err_t rf_err = refine_query_result(&s_runtime_config, &s_last_query_result);
             if (rf_err != ESP_OK) {
                 ESP_LOGW(TAG, "refine skipped/failed: %s", esp_err_to_name(rf_err));
@@ -3063,7 +3126,7 @@ static void handle_press_release_and_upload(record_owner_t owner)
         render_ui_query_result(&s_last_query_result);
         render_ui_status(APP_STATE_IDLE, "Idle", "ready for next take");
     } else {
-        render_ui_status(APP_STATE_ERROR, "Upload", esp_err_to_name(err));
+        render_ui_status(APP_STATE_ERROR, "Transcript", esp_err_to_name(err));
     }
     s_record_owner = RECORD_OWNER_NONE;
 }
@@ -3137,9 +3200,80 @@ static void toggle_translation_enabled(const char *reason)
              "translation %s via %s",
              s_runtime_config.translation_enabled ? "enabled" : "disabled",
              reason != NULL ? reason : "toggle");
-    render_ui_status(APP_STATE_IDLE,
-                     "Translate",
-                     s_runtime_config.translation_enabled ? "enabled" : "disabled");
+    if (s_touch_config_mode) {
+        notify_ui_dashboard();
+    } else {
+        render_ui_status(APP_STATE_IDLE,
+                         "Translate",
+                         s_runtime_config.translation_enabled ? "enabled" : "disabled");
+    }
+}
+
+static void toggle_refine_enabled(const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    next_config.refine_enabled = !s_runtime_config.refine_enabled;
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save refine toggle failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "refine %s via %s",
+             s_runtime_config.refine_enabled ? "enabled" : "disabled",
+             reason != NULL ? reason : "toggle");
+    if (s_touch_config_mode) {
+        notify_ui_dashboard();
+    } else {
+        render_ui_status(APP_STATE_IDLE,
+                         "Refine",
+                         s_runtime_config.refine_enabled ? "enabled" : "disabled");
+    }
+}
+
+static void set_touch_config_mode(bool enabled, const char *reason)
+{
+    if (s_touch_config_mode == enabled) {
+        notify_ui_dashboard();
+        return;
+    }
+
+    s_touch_config_mode = enabled;
+    s_touch_last_tap_release_ms = 0;
+    s_touch_ignore_until_ms = 0;
+    ESP_LOGI(TAG,
+             "touch config mode %s via %s",
+             enabled ? "entered" : "exited",
+             reason != NULL ? reason : "touch");
+    notify_ui_dashboard();
+}
+
+static bool handle_touch_config_tap(uint32_t held_ms)
+{
+    uint16_t x = 0;
+    uint16_t y = 0;
+
+    if (held_ms == 0U || held_ms > (uint32_t)VIBE_BOX_TOUCH_TAP_MAX_MS) {
+        return false;
+    }
+    if (!touch_input_get_last_point(&x, &y)) {
+        ESP_LOGW(TAG, "config tap ignored; touch coordinates unavailable");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "touch config tap x=%u y=%u", (unsigned)x, (unsigned)y);
+    if (y < TOUCH_CONFIG_BUTTON_TOP_Y) {
+        return false;
+    }
+
+    if (x < TOUCH_CONFIG_BUTTON_SPLIT_X) {
+        toggle_translation_enabled("config tap");
+    } else {
+        toggle_refine_enabled("config tap");
+    }
+    return true;
 }
 
 static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
@@ -3188,7 +3322,7 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
     (void)user_ctx;
     if (event == TOUCH_EVENT_SWIPE_LEFT || event == TOUCH_EVENT_SWIPE_RIGHT) {
         ESP_LOGI(TAG,
-                 "touch swipe %s detected; toggling translation",
+                 "touch swipe %s detected; toggling config mode",
                  event == TOUCH_EVENT_SWIPE_LEFT ? "left" : "right");
         s_touch_press_start_ms = 0;
         s_touch_last_tap_release_ms = 0;
@@ -3198,7 +3332,8 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
             s_touch_release_pending = false;
             s_touch_abort_pending = true;
         }
-        toggle_translation_enabled(event == TOUCH_EVENT_SWIPE_LEFT ? "swipe left" : "swipe right");
+        set_touch_config_mode(!s_touch_config_mode,
+                              event == TOUCH_EVENT_SWIPE_LEFT ? "swipe left" : "swipe right");
         return;
     }
 
@@ -3217,6 +3352,9 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         ESP_LOGI(TAG, "touch down");
         s_touch_press_start_ms = now_ms;
         s_touch_recording_started = false;
+        if (s_touch_config_mode) {
+            return;
+        }
         BaseType_t ok = xTaskCreatePinnedToCore(
             touch_hold_recording_task,
             "touch_hold",
@@ -3242,7 +3380,10 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         bool touch_recording_started = s_touch_recording_started;
         s_touch_press_start_ms = 0;
         s_touch_recording_started = false;
-        if (touch_recording_started) {
+        if (s_touch_config_mode) {
+            s_touch_last_tap_release_ms = 0;
+            (void)handle_touch_config_tap(held_ms);
+        } else if (touch_recording_started) {
             s_touch_last_tap_release_ms = 0;
             s_touch_release_pending = true;
         } else if (s_record_owner == RECORD_OWNER_TOUCH && audio_input_recording_is_active()) {
@@ -3498,7 +3639,9 @@ void app_main(void)
 
     while (true) {
         if (s_runtime_config_reconnect_requested && state != APP_STATE_RECORDING &&
-            state != APP_STATE_UPLOADING) {
+            state != APP_STATE_TRANSCRIPTING &&
+            state != APP_STATE_TRANSLATING &&
+            state != APP_STATE_REFINING) {
             s_runtime_config_reconnect_requested = false;
             s_provisioning_reconnect_requested = false;
             if (!runtime_config_is_complete(&s_runtime_config)) {

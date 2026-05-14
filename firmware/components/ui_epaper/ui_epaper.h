@@ -42,6 +42,12 @@ void ui_epaper_draw_text(int x, int y, const char *text);
 /* Draw a horizontal line of black pixels at row y from x0 to x1 inclusive. */
 void ui_epaper_draw_hline(int y, int x0, int x1);
 
+/* Draw a vertical line of black pixels at column x from y0 to y1 inclusive. */
+void ui_epaper_draw_vline(int x, int y0, int y1);
+
+/* Draw a 1px rectangle outline. */
+void ui_epaper_draw_rect(int x0, int y0, int x1, int y1);
+
 /* Push the current buffer to the panel using a partial refresh. */
 esp_err_t ui_epaper_flush(void);
 
