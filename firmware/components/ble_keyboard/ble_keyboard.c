@@ -1,5 +1,6 @@
 #include "ble_keyboard.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -27,7 +28,7 @@
 #define TEXT_OPCODE_BEGIN 0x01
 #define TEXT_OPCODE_CHUNK 0x02
 #define TEXT_OPCODE_END 0x03
-#define CONFIG_BUFFER_SIZE 2048
+#define CONFIG_BUFFER_SIZE 4096
 #define CONFIG_OPCODE_GET 0x10
 #define CONFIG_OPCODE_SAVE_BEGIN 0x21
 #define CONFIG_OPCODE_SAVE_CHUNK 0x22
@@ -37,6 +38,10 @@
 #define CONFIG_OPCODE_RESP_END 0x83
 #define CONFIG_OPCODE_RESP_ERROR 0x84
 #define GATT_CCC_NOTIFY_ENABLE 0x0001
+#define CONFIG_NOTIFY_TASK_STACK 4096
+#define CONFIG_NOTIFY_TASK_PRIORITY 5
+#define CONFIG_REQUEST_TASK_STACK 8192
+#define CONFIG_REQUEST_TASK_PRIORITY 5
 
 static const char *TAG = "ble_keyboard";
 
@@ -195,6 +200,18 @@ static bool s_config_notify_enabled;
 static bool s_started;
 static bool s_adv_data_ready;
 static bool s_random_addr_ready;
+static TaskHandle_t s_config_notify_task_handle;
+static TaskHandle_t s_config_request_task_handle;
+
+typedef struct {
+    uint8_t end_opcode;
+    char payload[];
+} config_notify_job_t;
+
+typedef struct {
+    uint8_t opcode;
+    char payload[];
+} config_request_job_t;
 
 void ble_keyboard_set_config_callbacks(ble_keyboard_config_get_cb_t get_cb,
                                        ble_keyboard_config_set_cb_t set_cb,
@@ -313,48 +330,177 @@ static esp_err_t config_notify_response(uint8_t end_opcode, const char *payload)
     return notify_packet(s_text_handles[TEXT_IDX_CONFIG_CHAR_VAL], end_opcode, NULL, 0);
 }
 
+static void config_notify_task(void *arg)
+{
+    config_notify_job_t *job = (config_notify_job_t *)arg;
+    esp_err_t err = config_notify_response(job->end_opcode, job->payload);
+
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "config notify response failed: %s", esp_err_to_name(err));
+    }
+
+    free(job);
+    s_config_notify_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t config_queue_response(uint8_t end_opcode, const char *payload)
+{
+    const char *text = payload != NULL ? payload : "";
+    size_t payload_len = strlen(text);
+    config_notify_job_t *job;
+
+    if (!s_config_notify_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_config_request_task_handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_config_notify_task_handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    job = malloc(sizeof(*job) + payload_len + 1U);
+    if (job == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    job->end_opcode = end_opcode;
+    memcpy(job->payload, text, payload_len + 1U);
+
+    BaseType_t ok = xTaskCreate(
+        config_notify_task,
+        "cfg_notify",
+        CONFIG_NOTIFY_TASK_STACK,
+        job,
+        CONFIG_NOTIFY_TASK_PRIORITY,
+        &s_config_notify_task_handle);
+    if (ok != pdPASS) {
+        s_config_notify_task_handle = NULL;
+        free(job);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
 static void config_send_error(const char *message)
 {
-    esp_err_t err = config_notify_response(CONFIG_OPCODE_RESP_ERROR,
-                                           message != NULL ? message : "config request failed");
+    esp_err_t err = config_queue_response(CONFIG_OPCODE_RESP_ERROR,
+                                          message != NULL ? message : "config request failed");
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "config error notify failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "config error queue failed: %s", esp_err_to_name(err));
     }
+}
+
+static void config_request_task(void *arg)
+{
+    config_request_job_t *job = (config_request_job_t *)arg;
+    esp_err_t err;
+
+    if (job->opcode == CONFIG_OPCODE_GET) {
+        char *response = calloc(1, CONFIG_BUFFER_SIZE);
+        if (response == NULL) {
+            (void)config_notify_response(CONFIG_OPCODE_RESP_ERROR, "config get out of memory");
+            goto cleanup;
+        }
+        if (s_config_get_cb == NULL) {
+            (void)config_notify_response(CONFIG_OPCODE_RESP_ERROR, "config get callback missing");
+            free(response);
+            goto cleanup;
+        }
+
+        err = s_config_get_cb(response, CONFIG_BUFFER_SIZE, s_config_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "config get failed: %s", esp_err_to_name(err));
+            (void)config_notify_response(CONFIG_OPCODE_RESP_ERROR, esp_err_to_name(err));
+            free(response);
+            goto cleanup;
+        }
+
+        err = config_notify_response(CONFIG_OPCODE_RESP_END, response);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "config get response notify failed: %s", esp_err_to_name(err));
+        }
+        free(response);
+    } else if (job->opcode == CONFIG_OPCODE_SAVE_END) {
+        char response[256] = {0};
+
+        if (s_config_set_cb == NULL) {
+            (void)config_notify_response(CONFIG_OPCODE_RESP_ERROR, "config set callback missing");
+            goto cleanup;
+        }
+
+        err = s_config_set_cb(job->payload, response, sizeof(response), s_config_ctx);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "config set failed: %s", esp_err_to_name(err));
+            (void)config_notify_response(CONFIG_OPCODE_RESP_ERROR,
+                                         response[0] != '\0' ? response : esp_err_to_name(err));
+            goto cleanup;
+        }
+
+        err = config_notify_response(CONFIG_OPCODE_RESP_END,
+                                     response[0] != '\0' ? response : "{\"ok\":true}");
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "config set response notify failed: %s", esp_err_to_name(err));
+        }
+    }
+
+cleanup:
+    free(job);
+    s_config_request_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+static esp_err_t config_queue_request(uint8_t opcode, const char *payload)
+{
+    const char *text = payload != NULL ? payload : "";
+    size_t payload_len = strlen(text);
+    config_request_job_t *job;
+
+    if (!s_config_notify_enabled) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (s_config_request_task_handle != NULL || s_config_notify_task_handle != NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    job = malloc(sizeof(*job) + payload_len + 1U);
+    if (job == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    job->opcode = opcode;
+    memcpy(job->payload, text, payload_len + 1U);
+
+    BaseType_t ok = xTaskCreate(
+        config_request_task,
+        "cfg_request",
+        CONFIG_REQUEST_TASK_STACK,
+        job,
+        CONFIG_REQUEST_TASK_PRIORITY,
+        &s_config_request_task_handle);
+    if (ok != pdPASS) {
+        s_config_request_task_handle = NULL;
+        free(job);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
 }
 
 static void config_handle_get(void)
 {
-    char response[CONFIG_BUFFER_SIZE];
-    esp_err_t err;
-
-    if (s_config_get_cb == NULL) {
-        config_send_error("config get callback missing");
-        return;
-    }
-
-    memset(response, 0, sizeof(response));
-    err = s_config_get_cb(response, sizeof(response), s_config_ctx);
+    esp_err_t err = config_queue_request(CONFIG_OPCODE_GET, NULL);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "config get failed: %s", esp_err_to_name(err));
-        config_send_error(esp_err_to_name(err));
-        return;
-    }
-
-    err = config_notify_response(CONFIG_OPCODE_RESP_END, response);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "config get response notify failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "config get request queue failed: %s", esp_err_to_name(err));
     }
 }
 
 static void config_handle_save_end(void)
 {
-    char response[256];
     esp_err_t err;
 
-    if (s_config_set_cb == NULL) {
-        config_send_error("config set callback missing");
-        return;
-    }
     if (s_config_rx_len >= sizeof(s_config_rx_buffer)) {
         s_config_rx_len = 0;
         config_send_error("config payload too large");
@@ -362,18 +508,10 @@ static void config_handle_save_end(void)
     }
 
     s_config_rx_buffer[s_config_rx_len] = '\0';
-    memset(response, 0, sizeof(response));
-    err = s_config_set_cb(s_config_rx_buffer, response, sizeof(response), s_config_ctx);
+    err = config_queue_request(CONFIG_OPCODE_SAVE_END, s_config_rx_buffer);
     s_config_rx_len = 0;
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "config set failed: %s", esp_err_to_name(err));
-        config_send_error(response[0] != '\0' ? response : esp_err_to_name(err));
-        return;
-    }
-
-    err = config_notify_response(CONFIG_OPCODE_RESP_END, response[0] != '\0' ? response : "{\"ok\":true}");
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "config set response notify failed: %s", esp_err_to_name(err));
+        ESP_LOGW(TAG, "config set request queue failed: %s", esp_err_to_name(err));
     }
 }
 

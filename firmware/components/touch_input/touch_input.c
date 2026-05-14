@@ -17,13 +17,20 @@ static const char *TAG = "touch_input";
  * nibble), which is all we need for the press/release detection used by
  * the press-and-hold trigger. */
 #define TOUCH_REG_FINGER_NUM   0x02
+#define TOUCH_REG_POINT1_XH    0x03
 #define TOUCH_PROBE_TIMEOUT_MS 50
 #define TOUCH_I2C_TIMEOUT_MS   50
+#define TOUCH_SWIPE_MIN_DELTA  60
 
 #define DEFAULT_I2C_SPEED_HZ     100000U
 #define DEFAULT_POLL_PERIOD_MS   20U
 #define DEFAULT_DEBOUNCE_SAMPLES 2U
 #define DEFAULT_I2C_ADDR         0x38
+
+typedef struct {
+    uint16_t x;
+    uint16_t y;
+} touch_point_t;
 
 typedef struct {
     touch_input_config_t cfg;
@@ -34,6 +41,9 @@ typedef struct {
     i2c_master_dev_handle_t dev;
 
     bool pressed;
+    bool have_press_point;
+    touch_point_t press_point;
+    touch_point_t last_point;
 } touch_state_t;
 
 static touch_state_t s_state;
@@ -121,6 +131,40 @@ static esp_err_t read_finger_num(touch_state_t *st, uint8_t *out)
     return err;
 }
 
+static esp_err_t read_touch_point(touch_state_t *st, touch_point_t *out)
+{
+    uint8_t reg = TOUCH_REG_POINT1_XH;
+    uint8_t raw[4] = {0};
+    esp_err_t err;
+
+    if (out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = i2c_master_transmit_receive(st->dev, &reg, 1, raw, sizeof(raw), TOUCH_I2C_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    out->x = (uint16_t)(((raw[0] & 0x0F) << 8) | raw[1]);
+    out->y = (uint16_t)(((raw[2] & 0x0F) << 8) | raw[3]);
+    return ESP_OK;
+}
+
+static touch_event_t swipe_event_from_points(const touch_point_t *start,
+                                             const touch_point_t *end)
+{
+    int dx = (int)end->x - (int)start->x;
+    int dy = (int)end->y - (int)start->y;
+    int abs_dx = dx < 0 ? -dx : dx;
+    int abs_dy = dy < 0 ? -dy : dy;
+
+    if (abs_dx < TOUCH_SWIPE_MIN_DELTA || abs_dx <= abs_dy) {
+        return TOUCH_EVENT_UP;
+    }
+    return dx < 0 ? TOUCH_EVENT_SWIPE_LEFT : TOUCH_EVENT_SWIPE_RIGHT;
+}
+
 /* Scan the I2C bus and log every responding address. Helpful when the touch
  * IC part number (and therefore its address) is unknown. */
 static void scan_i2c_bus(touch_state_t *st)
@@ -152,11 +196,17 @@ static void touch_task(void *arg)
 
     while (true) {
         uint8_t finger = 0;
+        touch_point_t point = {0};
+        bool have_point = false;
         esp_err_t err = read_finger_num(st, &finger);
         bool sample_pressed;
         if (err == ESP_OK) {
             consecutive_errors = 0;
             sample_pressed = (finger > 0);
+            if (sample_pressed && read_touch_point(st, &point) == ESP_OK) {
+                have_point = true;
+                st->last_point = point;
+            }
         } else {
             consecutive_errors++;
             /* Log the very first error and then at most once every ~10s to
@@ -185,8 +235,20 @@ static void touch_task(void *arg)
             stable_pressed = candidate_pressed;
             st->pressed = stable_pressed;
             if (st->cb != NULL) {
-                st->cb(stable_pressed ? TOUCH_EVENT_DOWN : TOUCH_EVENT_UP,
-                       st->user_ctx);
+                touch_event_t event = stable_pressed ? TOUCH_EVENT_DOWN : TOUCH_EVENT_UP;
+                if (stable_pressed) {
+                    if (have_point) {
+                        st->press_point = point;
+                        st->last_point = point;
+                        st->have_press_point = true;
+                    } else {
+                        st->have_press_point = false;
+                    }
+                } else if (st->have_press_point) {
+                    event = swipe_event_from_points(&st->press_point, &st->last_point);
+                    st->have_press_point = false;
+                }
+                st->cb(event, st->user_ctx);
             }
         }
 

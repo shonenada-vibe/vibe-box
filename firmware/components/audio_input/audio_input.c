@@ -408,6 +408,8 @@ typedef struct {
 } audio_recording_ctx_t;
 
 static audio_recording_ctx_t *s_rec_ctx;
+static bool s_rec_stop_in_progress;
+static portMUX_TYPE s_rec_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static void audio_recording_task(void *arg)
 {
@@ -456,7 +458,10 @@ esp_err_t audio_input_recording_start(const audio_input_i2s_config_t *cfg,
     if (cfg->bclk_gpio < 0 || cfg->ws_gpio < 0 || cfg->din_gpio < 0) {
         return ESP_ERR_INVALID_ARG;
     }
-    if (s_rec_ctx != NULL) {
+    portENTER_CRITICAL(&s_rec_lock);
+    bool already_recording = s_rec_ctx != NULL || s_rec_stop_in_progress;
+    portEXIT_CRITICAL(&s_rec_lock);
+    if (already_recording) {
         ESP_LOGW(TAG, "recording_start called while already recording");
         return ESP_ERR_INVALID_STATE;
     }
@@ -545,7 +550,9 @@ esp_err_t audio_input_recording_start(const audio_input_i2s_config_t *cfg,
         goto fail;
     }
 
+    portENTER_CRITICAL(&s_rec_lock);
     s_rec_ctx = ctx;
+    portEXIT_CRITICAL(&s_rec_lock);
     ESP_LOGI(TAG,
              "recording started max_ms=%" PRIu32 " capacity=%u bytes",
              max_duration_ms,
@@ -567,18 +574,31 @@ fail:
 
 bool audio_input_recording_is_active(void)
 {
-    return s_rec_ctx != NULL;
+    portENTER_CRITICAL(&s_rec_lock);
+    bool active = s_rec_ctx != NULL;
+    portEXIT_CRITICAL(&s_rec_lock);
+    return active;
 }
 
 esp_err_t audio_input_recording_stop(uint8_t **wav_out,
                                      size_t *wav_size_out,
                                      uint32_t *duration_ms_out)
 {
-    audio_recording_ctx_t *ctx = s_rec_ctx;
+    audio_recording_ctx_t *ctx;
 
+    portENTER_CRITICAL(&s_rec_lock);
+    ctx = s_rec_ctx;
     if (ctx == NULL) {
+        portEXIT_CRITICAL(&s_rec_lock);
         return ESP_ERR_INVALID_STATE;
     }
+    if (s_rec_stop_in_progress) {
+        portEXIT_CRITICAL(&s_rec_lock);
+        ESP_LOGW(TAG, "recording_stop called while stop already in progress");
+        return ESP_ERR_INVALID_STATE;
+    }
+    s_rec_stop_in_progress = true;
+    portEXIT_CRITICAL(&s_rec_lock);
 
     ctx->stop_requested = true;
     /* Worst case the read in flight has a 100ms timeout. Wait up to 2s. */
@@ -589,7 +609,10 @@ esp_err_t audio_input_recording_stop(uint8_t **wav_out,
     i2s_channel_disable(ctx->rx_handle);
     i2s_del_channel(ctx->rx_handle);
     vSemaphoreDelete(ctx->done_sem);
+    portENTER_CRITICAL(&s_rec_lock);
     s_rec_ctx = NULL;
+    s_rec_stop_in_progress = false;
+    portEXIT_CRITICAL(&s_rec_lock);
 
     size_t pcm_size = ctx->captured;
     uint32_t duration_ms = 0;

@@ -57,13 +57,18 @@ static const char *TAG = "vibe_box";
 #define RUNTIME_API_TOKEN_MAX           192
 #define RUNTIME_WHISPER_API_URL_MAX     256
 #define RUNTIME_WHISPER_API_KEY_MAX     256
+#define RUNTIME_OPENAI_API_BASE_MAX     256
+#define RUNTIME_OPENAI_API_KEY_MAX      256
 #define RUNTIME_STT_MODEL_MAX           96
+#define RUNTIME_TRANSLATION_MODEL_MAX   96
+#define RUNTIME_TRANSLATION_LANGUAGE_MAX 32
+#define RUNTIME_TRANSLATION_PROMPT_MAX  512
 #define RUNTIME_DEVICE_ID_MAX           64
 #define RUNTIME_FIRMWARE_VERSION_MAX    64
 #define RUNTIME_LANGUAGE_MAX            16
-#define PROVISIONING_FORM_BUFFER_SIZE   1024
-#define PROVISIONING_HTML_BUFFER_SIZE   4096
-#define PROVISIONING_STATUS_BUFFER_SIZE 1024
+#define PROVISIONING_FORM_BUFFER_SIZE   4096
+#define PROVISIONING_HTML_BUFFER_SIZE   8192
+#define PROVISIONING_STATUS_BUFFER_SIZE 2048
 #define WIFI_CONNECT_TIMEOUT_MS         30000
 #define NVS_NAMESPACE                   "vibe_box"
 
@@ -89,6 +94,36 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_DEFAULT_STT_MODEL CONFIG_VIBE_BOX_STT_MODEL
 #else
 #define VIBE_BOX_DEFAULT_STT_MODEL "whisper-large-v3-turbo"
+#endif
+
+#ifdef CONFIG_VIBE_BOX_OPENAI_API_BASE
+#define VIBE_BOX_DEFAULT_OPENAI_API_BASE CONFIG_VIBE_BOX_OPENAI_API_BASE
+#else
+#define VIBE_BOX_DEFAULT_OPENAI_API_BASE ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_OPENAI_API_KEY
+#define VIBE_BOX_DEFAULT_OPENAI_API_KEY CONFIG_VIBE_BOX_OPENAI_API_KEY
+#else
+#define VIBE_BOX_DEFAULT_OPENAI_API_KEY ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TRANSLATION_MODEL
+#define VIBE_BOX_DEFAULT_TRANSLATION_MODEL CONFIG_VIBE_BOX_TRANSLATION_MODEL
+#else
+#define VIBE_BOX_DEFAULT_TRANSLATION_MODEL "gpt-4o-mini"
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TRANSLATION_TARGET_LANGUAGE
+#define VIBE_BOX_DEFAULT_TRANSLATION_TARGET_LANGUAGE CONFIG_VIBE_BOX_TRANSLATION_TARGET_LANGUAGE
+#else
+#define VIBE_BOX_DEFAULT_TRANSLATION_TARGET_LANGUAGE "English"
+#endif
+
+#ifdef CONFIG_VIBE_BOX_TRANSLATION_PROMPT
+#define VIBE_BOX_DEFAULT_TRANSLATION_PROMPT CONFIG_VIBE_BOX_TRANSLATION_PROMPT
+#else
+#define VIBE_BOX_DEFAULT_TRANSLATION_PROMPT "You are a translation engine. Translate the user text to the target language. Return only the translated text."
 #endif
 
 #ifdef CONFIG_VIBE_BOX_LANGUAGE
@@ -311,6 +346,12 @@ typedef struct {
     char whisper_api_url[RUNTIME_WHISPER_API_URL_MAX];
     char whisper_api_key[RUNTIME_WHISPER_API_KEY_MAX];
     char stt_model[RUNTIME_STT_MODEL_MAX];
+    char openai_api_base[RUNTIME_OPENAI_API_BASE_MAX];
+    char openai_api_key[RUNTIME_OPENAI_API_KEY_MAX];
+    char translation_model[RUNTIME_TRANSLATION_MODEL_MAX];
+    char translation_target_language[RUNTIME_TRANSLATION_LANGUAGE_MAX];
+    char translation_prompt[RUNTIME_TRANSLATION_PROMPT_MAX];
+    bool translation_enabled;
     char device_id[RUNTIME_DEVICE_ID_MAX];
     char firmware_version[RUNTIME_FIRMWARE_VERSION_MAX];
     char language[RUNTIME_LANGUAGE_MAX];
@@ -356,6 +397,8 @@ static uint32_t s_touch_last_tap_release_ms;
 static uint32_t s_touch_ignore_until_ms;
 static volatile record_owner_t s_record_owner;
 static volatile bool s_touch_recording_started;
+static volatile bool s_touch_release_pending;
+static volatile bool s_touch_abort_pending;
 static bool s_touch_ignoring_current_press;
 static TaskHandle_t s_ui_dashboard_task_handle;
 static adc_oneshot_unit_handle_t s_battery_adc_handle;
@@ -416,6 +459,22 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
             VIBE_BOX_DEFAULT_WHISPER_API_KEY,
             sizeof(cfg->whisper_api_key));
     strlcpy(cfg->stt_model, VIBE_BOX_DEFAULT_STT_MODEL, sizeof(cfg->stt_model));
+    strlcpy(cfg->openai_api_base,
+            VIBE_BOX_DEFAULT_OPENAI_API_BASE,
+            sizeof(cfg->openai_api_base));
+    strlcpy(cfg->openai_api_key,
+            VIBE_BOX_DEFAULT_OPENAI_API_KEY,
+            sizeof(cfg->openai_api_key));
+    strlcpy(cfg->translation_model,
+            VIBE_BOX_DEFAULT_TRANSLATION_MODEL,
+            sizeof(cfg->translation_model));
+    strlcpy(cfg->translation_target_language,
+            VIBE_BOX_DEFAULT_TRANSLATION_TARGET_LANGUAGE,
+            sizeof(cfg->translation_target_language));
+    strlcpy(cfg->translation_prompt,
+            VIBE_BOX_DEFAULT_TRANSLATION_PROMPT,
+            sizeof(cfg->translation_prompt));
+    cfg->translation_enabled = false;
     strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
     strlcpy(cfg->firmware_version,
             CONFIG_VIBE_BOX_FIRMWARE_VERSION,
@@ -442,6 +501,13 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  whisper_api_url=%s", cfg->whisper_api_url[0] ? cfg->whisper_api_url : "<empty>");
     ESP_LOGI(TAG, "  whisper_api_key=%s", cfg->whisper_api_key[0] ? "<configured>" : "<empty>");
     ESP_LOGI(TAG, "  stt_model=%s", cfg->stt_model[0] ? cfg->stt_model : "<empty>");
+    ESP_LOGI(TAG, "  openai_api_base=%s", cfg->openai_api_base[0] ? cfg->openai_api_base : "<empty>");
+    ESP_LOGI(TAG, "  openai_api_key=%s", cfg->openai_api_key[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG, "  translation_model=%s", cfg->translation_model[0] ? cfg->translation_model : "<empty>");
+    ESP_LOGI(TAG,
+             "  translation_target_language=%s",
+             cfg->translation_target_language[0] ? cfg->translation_target_language : "<empty>");
+    ESP_LOGI(TAG, "  translation_enabled=%d", cfg->translation_enabled);
     ESP_LOGI(TAG, "  device_id=%s", cfg->device_id[0] ? cfg->device_id : "<empty>");
     ESP_LOGI(TAG,
              "  firmware_version=%s",
@@ -516,6 +582,24 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
     nvs_load_string_or_default(handle, "whisper_url", cfg->whisper_api_url, sizeof(cfg->whisper_api_url));
     nvs_load_string_or_default(handle, "whisper_key", cfg->whisper_api_key, sizeof(cfg->whisper_api_key));
     nvs_load_string_or_default(handle, "stt_model", cfg->stt_model, sizeof(cfg->stt_model));
+    nvs_load_string_or_default(handle, "openai_base", cfg->openai_api_base, sizeof(cfg->openai_api_base));
+    nvs_load_string_or_default(handle, "openai_key", cfg->openai_api_key, sizeof(cfg->openai_api_key));
+    nvs_load_string_or_default(handle, "tr_model", cfg->translation_model, sizeof(cfg->translation_model));
+    nvs_load_string_or_default(handle,
+                               "tr_lang",
+                               cfg->translation_target_language,
+                               sizeof(cfg->translation_target_language));
+    nvs_load_string_or_default(handle,
+                               "tr_prompt",
+                               cfg->translation_prompt,
+                               sizeof(cfg->translation_prompt));
+    {
+        uint8_t enabled = 0;
+
+        if (nvs_get_u8(handle, "tr_en", &enabled) == ESP_OK) {
+            cfg->translation_enabled = enabled != 0U;
+        }
+    }
     nvs_load_string_or_default(handle, "device_id", cfg->device_id, sizeof(cfg->device_id));
     nvs_load_string_or_default(handle, "fw_ver", cfg->firmware_version, sizeof(cfg->firmware_version));
     nvs_load_string_or_default(handle, "language", cfg->language, sizeof(cfg->language));
@@ -575,6 +659,36 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
         ESP_LOGE(TAG, "save stt_model failed: %s", esp_err_to_name(err));
         goto exit;
     }
+    err = nvs_set_str(handle, "openai_base", cfg->openai_api_base);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save openai_base failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "openai_key", cfg->openai_api_key);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save openai_key failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "tr_model", cfg->translation_model);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tr_model failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "tr_lang", cfg->translation_target_language);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tr_lang failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "tr_prompt", cfg->translation_prompt);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tr_prompt failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u8(handle, "tr_en", cfg->translation_enabled ? 1U : 0U);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tr_en failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
     err = nvs_set_str(handle, "device_id", cfg->device_id);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "save device_id failed: %s", esp_err_to_name(err));
@@ -622,6 +736,34 @@ static bool json_copy_string(cJSON *root, const char *key, char *dst, size_t dst
     return true;
 }
 
+static bool json_copy_bool(cJSON *root, const char *key, bool *dst)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+
+    if (item == NULL) {
+        return true;
+    }
+    if (cJSON_IsBool(item)) {
+        *dst = cJSON_IsTrue(item);
+        return true;
+    }
+    if (cJSON_IsNumber(item)) {
+        *dst = item->valuedouble != 0.0;
+        return true;
+    }
+    if (cJSON_IsString(item) && item->valuestring != NULL) {
+        if (strcmp(item->valuestring, "true") == 0 || strcmp(item->valuestring, "1") == 0) {
+            *dst = true;
+            return true;
+        }
+        if (strcmp(item->valuestring, "false") == 0 || strcmp(item->valuestring, "0") == 0) {
+            *dst = false;
+            return true;
+        }
+    }
+    return false;
+}
+
 static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, size_t dst_len)
 {
     cJSON *root = NULL;
@@ -642,6 +784,14 @@ static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, 
         cJSON_AddStringToObject(root, "whisper_api_url", cfg->whisper_api_url) == NULL ||
         cJSON_AddStringToObject(root, "whisper_api_key", cfg->whisper_api_key) == NULL ||
         cJSON_AddStringToObject(root, "stt_model", cfg->stt_model) == NULL ||
+        cJSON_AddStringToObject(root, "openai_api_base", cfg->openai_api_base) == NULL ||
+        cJSON_AddStringToObject(root, "openai_api_key", cfg->openai_api_key) == NULL ||
+        cJSON_AddStringToObject(root, "translation_model", cfg->translation_model) == NULL ||
+        cJSON_AddStringToObject(root,
+                                "translation_target_language",
+                                cfg->translation_target_language) == NULL ||
+        cJSON_AddStringToObject(root, "translation_prompt", cfg->translation_prompt) == NULL ||
+        cJSON_AddBoolToObject(root, "translation_enabled", cfg->translation_enabled) == NULL ||
         cJSON_AddStringToObject(root, "device_id", cfg->device_id) == NULL ||
         cJSON_AddStringToObject(root, "firmware_version", cfg->firmware_version) == NULL ||
         cJSON_AddStringToObject(root, "language", cfg->language) == NULL ||
@@ -686,6 +836,21 @@ static void fill_runtime_config_defaults(runtime_config_t *cfg)
     if (cfg->stt_model[0] == '\0') {
         strlcpy(cfg->stt_model, VIBE_BOX_DEFAULT_STT_MODEL, sizeof(cfg->stt_model));
     }
+    if (cfg->translation_model[0] == '\0') {
+        strlcpy(cfg->translation_model,
+                VIBE_BOX_DEFAULT_TRANSLATION_MODEL,
+                sizeof(cfg->translation_model));
+    }
+    if (cfg->translation_target_language[0] == '\0') {
+        strlcpy(cfg->translation_target_language,
+                VIBE_BOX_DEFAULT_TRANSLATION_TARGET_LANGUAGE,
+                sizeof(cfg->translation_target_language));
+    }
+    if (cfg->translation_prompt[0] == '\0') {
+        strlcpy(cfg->translation_prompt,
+                VIBE_BOX_DEFAULT_TRANSLATION_PROMPT,
+                sizeof(cfg->translation_prompt));
+    }
     if (cfg->recording_duration_ms == 0U) {
         cfg->recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
     }
@@ -723,6 +888,32 @@ static esp_err_t runtime_config_update_from_json(const char *json, runtime_confi
                           sizeof(next_config->whisper_api_key),
                           false) ||
         !json_copy_string(root, "stt_model", next_config->stt_model, sizeof(next_config->stt_model), false) ||
+        !json_copy_string(root,
+                          "openai_api_base",
+                          next_config->openai_api_base,
+                          sizeof(next_config->openai_api_base),
+                          false) ||
+        !json_copy_string(root,
+                          "openai_api_key",
+                          next_config->openai_api_key,
+                          sizeof(next_config->openai_api_key),
+                          false) ||
+        !json_copy_string(root,
+                          "translation_model",
+                          next_config->translation_model,
+                          sizeof(next_config->translation_model),
+                          false) ||
+        !json_copy_string(root,
+                          "translation_target_language",
+                          next_config->translation_target_language,
+                          sizeof(next_config->translation_target_language),
+                          false) ||
+        !json_copy_string(root,
+                          "translation_prompt",
+                          next_config->translation_prompt,
+                          sizeof(next_config->translation_prompt),
+                          false) ||
+        !json_copy_bool(root, "translation_enabled", &next_config->translation_enabled) ||
         !json_copy_string(root, "device_id", next_config->device_id, sizeof(next_config->device_id), false) ||
         !json_copy_string(root,
                           "firmware_version",
@@ -1479,6 +1670,230 @@ static esp_err_t parse_whisper_response(const char *response_body, query_result_
     return ESP_OK;
 }
 
+static esp_err_t build_openai_chat_url(const char *api_base, char *dst, size_t dst_len)
+{
+    const char *suffix = "chat/completions";
+    size_t len;
+
+    if (api_base == NULL || api_base[0] == '\0' || dst == NULL || dst_len == 0U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strstr(api_base, "/chat/completions") != NULL) {
+        if (snprintf(dst, dst_len, "%s", api_base) >= (int)dst_len) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        return ESP_OK;
+    }
+
+    len = strlen(api_base);
+    if (snprintf(dst,
+                 dst_len,
+                 "%s%s%s",
+                 api_base,
+                 (len > 0U && api_base[len - 1U] == '/') ? "" : "/",
+                 suffix) >= (int)dst_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    return ESP_OK;
+}
+
+static bool openai_api_base_is_deepseek(const char *api_base)
+{
+    return api_base != NULL && strstr(api_base, "deepseek.com") != NULL;
+}
+
+static const char *chat_response_content(const char *response_body)
+{
+    cJSON *root = cJSON_Parse(response_body);
+    cJSON *choices;
+    cJSON *choice;
+    cJSON *message;
+    cJSON *content;
+    const char *value = NULL;
+    static char translated[QUERY_REPLY_MAX];
+
+    translated[0] = '\0';
+    if (root == NULL) {
+        ESP_LOGE(TAG, "failed to parse translation JSON");
+        return NULL;
+    }
+
+    choices = cJSON_GetObjectItemCaseSensitive(root, "choices");
+    choice = cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;
+    message = choice != NULL ? cJSON_GetObjectItemCaseSensitive(choice, "message") : NULL;
+    content = message != NULL ? cJSON_GetObjectItemCaseSensitive(message, "content") : NULL;
+    if (!cJSON_IsString(content) || content->valuestring == NULL) {
+        content = choice != NULL ? cJSON_GetObjectItemCaseSensitive(choice, "text") : NULL;
+    }
+    if (!cJSON_IsString(content) || content->valuestring == NULL) {
+        content = cJSON_GetObjectItemCaseSensitive(root, "text");
+    }
+
+    if (cJSON_IsString(content) && content->valuestring != NULL && content->valuestring[0] != '\0') {
+        strlcpy(translated, content->valuestring, sizeof(translated));
+        value = translated;
+    }
+
+    cJSON_Delete(root);
+    return value;
+}
+
+static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
+                                                const char *transcript,
+                                                char **body_out)
+{
+    cJSON *root = NULL;
+    cJSON *messages = NULL;
+    cJSON *system_msg = NULL;
+    cJSON *user_msg = NULL;
+    cJSON *thinking = NULL;
+    char user_content[QUERY_TEXT_MAX + RUNTIME_TRANSLATION_LANGUAGE_MAX + 64];
+    char *printed = NULL;
+    esp_err_t err = ESP_OK;
+
+    if (cfg == NULL || transcript == NULL || transcript[0] == '\0' || body_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    root = cJSON_CreateObject();
+    messages = cJSON_CreateArray();
+    system_msg = cJSON_CreateObject();
+    user_msg = cJSON_CreateObject();
+    if (root == NULL || messages == NULL || system_msg == NULL || user_msg == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    snprintf(user_content,
+             sizeof(user_content),
+             "Target language: %s\nText:\n%s",
+             cfg->translation_target_language,
+             transcript);
+
+    if (cJSON_AddStringToObject(root, "model", cfg->translation_model) == NULL ||
+        cJSON_AddNumberToObject(root, "temperature", 0) == NULL ||
+        cJSON_AddStringToObject(system_msg, "role", "system") == NULL ||
+        cJSON_AddStringToObject(system_msg, "content", cfg->translation_prompt) == NULL ||
+        cJSON_AddStringToObject(user_msg, "role", "user") == NULL ||
+        cJSON_AddStringToObject(user_msg, "content", user_content) == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    if (openai_api_base_is_deepseek(cfg->openai_api_base)) {
+        thinking = cJSON_CreateObject();
+        if (thinking == NULL ||
+            cJSON_AddStringToObject(thinking, "type", "disabled") == NULL ||
+            !cJSON_AddItemToObject(root, "thinking", thinking)) {
+            err = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+        thinking = NULL;
+    }
+
+    if (!cJSON_AddItemToArray(messages, system_msg)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    system_msg = NULL;
+    if (!cJSON_AddItemToArray(messages, user_msg)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    user_msg = NULL;
+    if (!cJSON_AddItemToObject(root, "messages", messages)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    messages = NULL;
+
+    printed = cJSON_PrintUnformatted(root);
+    if (printed == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    *body_out = printed;
+    printed = NULL;
+
+cleanup:
+    if (printed != NULL) {
+        cJSON_free(printed);
+    }
+    cJSON_Delete(system_msg);
+    cJSON_Delete(user_msg);
+    cJSON_Delete(thinking);
+    cJSON_Delete(messages);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t translate_query_result(const runtime_config_t *cfg, query_result_t *result)
+{
+    char url[URL_BUFFER_SIZE];
+    char *request_body = NULL;
+    char *response_buf = NULL;
+    const char *translated;
+    int status = 0;
+    esp_err_t err;
+
+    if (cfg == NULL || result == NULL || result->transcript[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg->openai_api_base[0] == '\0' || cfg->translation_model[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = build_openai_chat_url(cfg->openai_api_base, url, sizeof(url));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    response_buf = calloc(1, QUERY_RESPONSE_BUFFER_SIZE);
+    if (response_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = build_translation_request_body(cfg, result->transcript, &request_body);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+
+    err = perform_http_request(cfg,
+                               url,
+                               HTTP_METHOD_POST,
+                               "application/json",
+                               cfg->openai_api_key,
+                               (const uint8_t *)request_body,
+                               strlen(request_body),
+                               response_buf,
+                               QUERY_RESPONSE_BUFFER_SIZE,
+                               &status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "translation request failed status=%d err=%s",
+                 status, esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    translated = chat_response_content(response_buf);
+    if (translated == NULL || translated[0] == '\0') {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    strlcpy(result->reply_text, translated, sizeof(result->reply_text));
+    strlcpy(result->display_lines[0], translated, sizeof(result->display_lines[0]));
+    result->display_line_count = 1U;
+    ESP_LOGI(TAG, "translation result=%s", result->reply_text);
+
+cleanup:
+    if (request_body != NULL) {
+        cJSON_free(request_body);
+    }
+    free(response_buf);
+    return err;
+}
+
 static void log_query_result(const query_result_t *result)
 {
     size_t i;
@@ -1663,7 +2078,7 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         sizeof(html),
         "<!doctype html><html><head><meta charset='utf-8'><title>Vibe Box Setup</title>"
         "<style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;max-width:680px;"
-        "margin:40px auto;padding:0 16px;}input{width:100%%;padding:10px;margin:8px 0 16px;"
+        "margin:40px auto;padding:0 16px;}input,textarea{width:100%%;padding:10px;margin:8px 0 16px;"
         "box-sizing:border-box;}button{padding:12px 16px;}code{background:#f4f4f4;padding:2px 4px;}"
         "</style></head><body><h1>Vibe Box Provisioning</h1>"
         "<p>Connect the device to your Wi-Fi and Whisper-compatible STT endpoint, then submit the form. "
@@ -1674,6 +2089,12 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "<label>Whisper API URL</label><input name='whisper_api_url' value='%s' maxlength='255' />"
         "<label>Whisper API Key</label><input name='whisper_api_key' type='password' value='%s' maxlength='255' />"
         "<label>STT Model</label><input name='stt_model' value='%s' maxlength='95' />"
+        "<label>OpenAI API Base</label><input name='openai_api_base' value='%s' maxlength='255' />"
+        "<label>OpenAI API Key</label><input name='openai_api_key' type='password' value='%s' maxlength='255' />"
+        "<label>Translation Model</label><input name='translation_model' value='%s' maxlength='95' />"
+        "<label>Translation Target Language</label><input name='translation_target_language' value='%s' maxlength='31' />"
+        "<label>Translation Prompt</label><textarea name='translation_prompt' maxlength='511'>%s</textarea>"
+        "<label><input name='translation_enabled' type='checkbox' value='1' %s /> Enable Translation</label>"
         "<label>Device ID</label><input name='device_id' value='%s' maxlength='63' />"
         "<label>Firmware Version</label><input name='firmware_version' value='%s' maxlength='63' />"
         "<label>Language</label><input name='language' value='%s' maxlength='15' />"
@@ -1686,6 +2107,12 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         s_runtime_config.whisper_api_url,
         s_runtime_config.whisper_api_key,
         s_runtime_config.stt_model,
+        s_runtime_config.openai_api_base,
+        s_runtime_config.openai_api_key,
+        s_runtime_config.translation_model,
+        s_runtime_config.translation_target_language,
+        s_runtime_config.translation_prompt,
+        s_runtime_config.translation_enabled ? "checked" : "",
         s_runtime_config.device_id,
         s_runtime_config.firmware_version,
         s_runtime_config.language,
@@ -1704,6 +2131,9 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              sizeof(payload),
              "{\"state\":\"%s\",\"wifi_ssid\":\"%s\",\"whisper_api_url\":\"%s\","
              "\"whisper_api_key_configured\":%s,\"stt_model\":\"%s\","
+             "\"openai_api_base\":\"%s\",\"openai_api_key_configured\":%s,"
+             "\"translation_model\":\"%s\",\"translation_target_language\":\"%s\","
+             "\"translation_enabled\":%s,"
              "\"device_id\":\"%s\",\"firmware_version\":\"%s\","
              "\"language\":\"%s\",\"recording_duration_ms\":%" PRIu32 "}",
              app_state_name(APP_STATE_PROVISIONING),
@@ -1711,6 +2141,11 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              s_runtime_config.whisper_api_url,
              s_runtime_config.whisper_api_key[0] ? "true" : "false",
              s_runtime_config.stt_model,
+             s_runtime_config.openai_api_base,
+             s_runtime_config.openai_api_key[0] ? "true" : "false",
+             s_runtime_config.translation_model,
+             s_runtime_config.translation_target_language,
+             s_runtime_config.translation_enabled ? "true" : "false",
              s_runtime_config.device_id,
              s_runtime_config.firmware_version,
              s_runtime_config.language,
@@ -1761,6 +2196,27 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
                        next_config.whisper_api_key,
                        sizeof(next_config.whisper_api_key));
     extract_form_value(body, "stt_model", next_config.stt_model, sizeof(next_config.stt_model));
+    extract_form_value(body,
+                       "openai_api_base",
+                       next_config.openai_api_base,
+                       sizeof(next_config.openai_api_base));
+    extract_form_value(body,
+                       "openai_api_key",
+                       next_config.openai_api_key,
+                       sizeof(next_config.openai_api_key));
+    extract_form_value(body,
+                       "translation_model",
+                       next_config.translation_model,
+                       sizeof(next_config.translation_model));
+    extract_form_value(body,
+                       "translation_target_language",
+                       next_config.translation_target_language,
+                       sizeof(next_config.translation_target_language));
+    extract_form_value(body,
+                       "translation_prompt",
+                       next_config.translation_prompt,
+                       sizeof(next_config.translation_prompt));
+    next_config.translation_enabled = strstr(body, "translation_enabled=1") != NULL;
     extract_form_value(body, "device_id", next_config.device_id, sizeof(next_config.device_id));
     extract_form_value(body,
                        "firmware_version",
@@ -1787,6 +2243,21 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
     }
     if (next_config.stt_model[0] == '\0') {
         strlcpy(next_config.stt_model, VIBE_BOX_DEFAULT_STT_MODEL, sizeof(next_config.stt_model));
+    }
+    if (next_config.translation_model[0] == '\0') {
+        strlcpy(next_config.translation_model,
+                VIBE_BOX_DEFAULT_TRANSLATION_MODEL,
+                sizeof(next_config.translation_model));
+    }
+    if (next_config.translation_target_language[0] == '\0') {
+        strlcpy(next_config.translation_target_language,
+                VIBE_BOX_DEFAULT_TRANSLATION_TARGET_LANGUAGE,
+                sizeof(next_config.translation_target_language));
+    }
+    if (next_config.translation_prompt[0] == '\0') {
+        strlcpy(next_config.translation_prompt,
+                VIBE_BOX_DEFAULT_TRANSLATION_PROMPT,
+                sizeof(next_config.translation_prompt));
     }
     if (next_config.recording_duration_ms == 0U) {
         next_config.recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
@@ -2035,6 +2506,14 @@ static void ui_dashboard_render_once(void)
     snprintf(line, sizeof(line),
              "Config: %s",
              ble_keyboard_config_notify_enabled() ? "ready" : "waiting");
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    snprintf(line,
+             sizeof(line),
+             "Translate: %s %.12s",
+             s_runtime_config.translation_enabled ? "on" : "off",
+             s_runtime_config.translation_target_language);
     ui_epaper_draw_text(x, y, line);
     y += line_step;
 
@@ -2323,10 +2802,22 @@ static void handle_press_release_and_upload(record_owner_t owner)
     free(wav_buf);
 
     if (err == ESP_OK) {
+        if (s_runtime_config.translation_enabled) {
+            char translate_detail[64];
+            snprintf(translate_detail,
+                     sizeof(translate_detail),
+                     "to %.40s",
+                     s_runtime_config.translation_target_language);
+            render_ui_status(APP_STATE_UPLOADING, "Translating", translate_detail);
+            esp_err_t tr_err = translate_query_result(&s_runtime_config, &s_last_query_result);
+            if (tr_err != ESP_OK) {
+                ESP_LOGW(TAG, "translation skipped/failed: %s", esp_err_to_name(tr_err));
+            }
+        }
         log_query_result(&s_last_query_result);
-        const char *text_to_input = s_last_query_result.transcript[0] != '\0'
-                                        ? s_last_query_result.transcript
-                                        : s_last_query_result.reply_text;
+        const char *text_to_input = s_last_query_result.reply_text[0] != '\0'
+                                        ? s_last_query_result.reply_text
+                                        : s_last_query_result.transcript;
         esp_err_t ble_err = ble_keyboard_notify_text(text_to_input);
         if (ble_err == ESP_OK) {
             ESP_LOGI(TAG, "sent transcript to BLE text input");
@@ -2397,6 +2888,26 @@ static bool recover_stuck_touch_recording(void)
     return false;
 }
 
+static void toggle_translation_enabled(const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    next_config.translation_enabled = !s_runtime_config.translation_enabled;
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save translation toggle failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "translation %s via %s",
+             s_runtime_config.translation_enabled ? "enabled" : "disabled",
+             reason != NULL ? reason : "toggle");
+    render_ui_status(APP_STATE_IDLE,
+                     "Translate",
+                     s_runtime_config.translation_enabled ? "enabled" : "disabled");
+}
+
 static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
 {
     if (held_ms == 0U || held_ms > (uint32_t)VIBE_BOX_TOUCH_TAP_MAX_MS) {
@@ -2441,6 +2952,22 @@ static void touch_hold_recording_task(void *arg)
 static void on_touch_event(touch_event_t event, void *user_ctx)
 {
     (void)user_ctx;
+    if (event == TOUCH_EVENT_SWIPE_LEFT || event == TOUCH_EVENT_SWIPE_RIGHT) {
+        ESP_LOGI(TAG,
+                 "touch swipe %s detected; toggling translation",
+                 event == TOUCH_EVENT_SWIPE_LEFT ? "left" : "right");
+        s_touch_press_start_ms = 0;
+        s_touch_last_tap_release_ms = 0;
+        s_touch_recording_started = false;
+        s_touch_ignoring_current_press = false;
+        if (s_record_owner == RECORD_OWNER_TOUCH && audio_input_recording_is_active()) {
+            s_touch_release_pending = false;
+            s_touch_abort_pending = true;
+        }
+        toggle_translation_enabled(event == TOUCH_EVENT_SWIPE_LEFT ? "swipe left" : "swipe right");
+        return;
+    }
+
     if (event == TOUCH_EVENT_DOWN) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (s_touch_ignore_until_ms != 0U &&
@@ -2483,7 +3010,11 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         s_touch_recording_started = false;
         if (touch_recording_started) {
             s_touch_last_tap_release_ms = 0;
-            handle_press_release_and_upload(RECORD_OWNER_TOUCH);
+            s_touch_release_pending = true;
+        } else if (s_record_owner == RECORD_OWNER_TOUCH && audio_input_recording_is_active()) {
+            ESP_LOGW(TAG, "touch up arrived after recording flag cleared; stopping from main loop");
+            s_touch_last_tap_release_ms = 0;
+            s_touch_release_pending = true;
         } else {
             handle_touch_tap_enter(release_ms, held_ms);
         }
@@ -2753,6 +3284,19 @@ void app_main(void)
             }
 
             if (audio_input_recording_is_active()) {
+                if (s_touch_abort_pending) {
+                    s_touch_abort_pending = false;
+                    s_touch_release_pending = false;
+                    abort_active_recording(RECORD_OWNER_TOUCH, "swipe cancelled");
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
+                if (s_touch_release_pending) {
+                    s_touch_release_pending = false;
+                    handle_press_release_and_upload(RECORD_OWNER_TOUCH);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
                 if (recover_stuck_touch_recording()) {
                     vTaskDelay(pdMS_TO_TICKS(200));
                     continue;

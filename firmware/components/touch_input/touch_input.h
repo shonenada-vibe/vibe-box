@@ -12,6 +12,8 @@ extern "C" {
 typedef enum {
     TOUCH_EVENT_DOWN = 0,
     TOUCH_EVENT_UP   = 1,
+    TOUCH_EVENT_SWIPE_LEFT,
+    TOUCH_EVENT_SWIPE_RIGHT,
 } touch_event_t;
 
 typedef void (*touch_event_cb_t)(touch_event_t event, void *user_ctx);
@@ -30,7 +32,8 @@ typedef struct {
 
 /*
  * Initializes the CST816T capacitive touch controller and starts a background
- * polling task that emits TOUCH_EVENT_DOWN / TOUCH_EVENT_UP edges through cb.
+ * polling task that emits TOUCH_EVENT_DOWN / TOUCH_EVENT_UP edges and simple
+ * horizontal swipe events through cb.
  *
  * The callback runs in the touch task context. Keep it short or hand off to
  * another queue/task. cb must remain valid for the lifetime of the process.

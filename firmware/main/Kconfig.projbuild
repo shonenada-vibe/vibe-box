@@ -59,6 +59,37 @@ config VIBE_BOX_STT_MODEL
     help
         Model form field sent to the Whisper-compatible transcription endpoint.
 
+config VIBE_BOX_OPENAI_API_BASE
+    string "OpenAI-compatible API base"
+    default ""
+    help
+        Base URL for the OpenAI-compatible LLM API used for translation. Use a
+        base such as https://api.openai.com/v1 or a full /chat/completions URL.
+
+config VIBE_BOX_OPENAI_API_KEY
+    string "OpenAI-compatible API key"
+    default ""
+    help
+        Optional bearer token sent to the OpenAI-compatible translation API.
+
+config VIBE_BOX_TRANSLATION_MODEL
+    string "Translation LLM model"
+    default "gpt-4o-mini"
+    help
+        Chat completions model name sent to the OpenAI-compatible translation API.
+
+config VIBE_BOX_TRANSLATION_TARGET_LANGUAGE
+    string "Translation target language"
+    default "English"
+    help
+        Default target language for translated transcription output.
+
+config VIBE_BOX_TRANSLATION_PROMPT
+    string "Translation system prompt"
+    default "You are a translation engine. Translate the user text to the target language. Return only the translated text."
+    help
+        System prompt sent with each translation request.
+
 config VIBE_BOX_DEVICE_ID
     string "Device ID"
     default "vibe-box-dev"
