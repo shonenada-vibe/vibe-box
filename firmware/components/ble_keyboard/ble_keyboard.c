@@ -384,7 +384,7 @@ static void config_send_error(const char *message)
 
 static void config_handle_get(void)
 {
-    char response[CONFIG_BUFFER_SIZE];
+    char *response;
     esp_err_t err;
 
     if (s_config_get_cb == NULL) {
@@ -392,18 +392,26 @@ static void config_handle_get(void)
         return;
     }
 
-    memset(response, 0, sizeof(response));
-    err = s_config_get_cb(response, sizeof(response), s_config_ctx);
+    response = calloc(1, CONFIG_BUFFER_SIZE);
+    if (response == NULL) {
+        config_send_error("config get out of memory");
+        return;
+    }
+
+    err = s_config_get_cb(response, CONFIG_BUFFER_SIZE, s_config_ctx);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "config get failed: %s", esp_err_to_name(err));
         config_send_error(esp_err_to_name(err));
-        return;
+        goto cleanup;
     }
 
     err = config_queue_response(CONFIG_OPCODE_RESP_END, response);
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "config get response queue failed: %s", esp_err_to_name(err));
     }
+
+cleanup:
+    free(response);
 }
 
 static void config_handle_save_end(void)
