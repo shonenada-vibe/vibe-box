@@ -84,6 +84,15 @@ config VIBE_BOX_RECORDING_DURATION_MS
     help
         Target recording duration for microphone capture and upload.
 
+config VIBE_BOX_RECORDING_MAX_MS
+    int "Press-and-hold recording max duration (ms)"
+    range 1000 120000
+    default 60000
+    help
+        Safety cap for touch press-and-hold recording. The firmware stops or
+        aborts a recording beyond this duration so a missed touch release cannot
+        keep the microphone and I2S pipeline active indefinitely.
+
 config VIBE_BOX_PWR_BUTTON_GPIO
     int "PWR button GPIO"
     range -1 48

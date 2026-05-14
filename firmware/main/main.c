@@ -16,6 +16,9 @@
 #include "touch_input.h"
 #include "ui_epaper.h"
 #include "driver/gpio.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_err.h"
 #include "esp_event.h"
 #include "esp_check.h"
@@ -47,7 +50,7 @@ static const char *TAG = "vibe_box";
 #define QUERY_DISPLAY_BITMAP_BYTES      UI_EPAPER_FRAME_BUFFER_BYTES
 #define MULTIPART_BOUNDARY              "----VibeBoxBoundary7MA4YWxkTrZu0gW"
 #define MAIN_LOOP_IDLE_MS               10000U
-#define UI_DASHBOARD_REFRESH_MS         60000U
+#define UI_DASHBOARD_REFRESH_MS         10000U
 #define RUNTIME_WIFI_SSID_MAX           33
 #define RUNTIME_WIFI_PASSWORD_MAX       65
 #define RUNTIME_SERVER_BASE_URL_MAX     192
@@ -256,16 +259,28 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_TOUCH_HOLD_START_MS 180
 #endif
 
-/* Press-and-hold microphone trigger. Use the BOOT button on ESP32-S3,
- * which is typically wired to GPIO 0 and reads active-low with the
- * internal pull-up enabled. */
+#ifdef CONFIG_VIBE_BOX_RECORDING_MAX_MS
+#define VIBE_BOX_RECORDING_MAX_MS CONFIG_VIBE_BOX_RECORDING_MAX_MS
+#else
+#define VIBE_BOX_RECORDING_MAX_MS 60000U
+#endif
+
+/* BOOT button on ESP32-S3 is typically wired to GPIO 0 and reads active-low
+ * with the internal pull-up enabled. */
 #define VIBE_BOX_RECORD_BUTTON_GPIO       0
-#define VIBE_BOX_RECORDING_MAX_MS         15000U
 #define VIBE_BOX_RECORDING_MIN_MS         300U
+#define VIBE_BOX_RECORDING_TIMEOUT_GRACE_MS 1000U
 #define VIBE_BOX_BUTTON_POLL_MS           20
 #define VIBE_BOX_BUTTON_DEBOUNCE_SAMPLES  3
 #define VIBE_BOX_TOUCH_POST_ENTER_IGNORE_MS 250U
 #define BLE_HID_KEY_ENTER                 0x28U
+#define VIBE_BOX_BATTERY_ADC_UNIT         ADC_UNIT_1
+#define VIBE_BOX_BATTERY_ADC_CHANNEL      ADC_CHANNEL_3
+#define VIBE_BOX_BATTERY_ADC_ATTEN        ADC_ATTEN_DB_12
+#define VIBE_BOX_BATTERY_EMPTY_MV         3000
+#define VIBE_BOX_BATTERY_FULL_MV          4120
+#define VIBE_BOX_BATTERY_DIVIDER_NUM      2
+#define VIBE_BOX_BATTERY_SAMPLE_COUNT     8
 
 static EventGroupHandle_t s_wifi_event_group;
 static esp_netif_t *s_sta_netif;
@@ -329,7 +344,6 @@ typedef struct {
 
 typedef enum {
     RECORD_OWNER_NONE = 0,
-    RECORD_OWNER_BOOT,
     RECORD_OWNER_TOUCH,
 } record_owner_t;
 
@@ -344,6 +358,10 @@ static volatile record_owner_t s_record_owner;
 static volatile bool s_touch_recording_started;
 static bool s_touch_ignoring_current_press;
 static TaskHandle_t s_ui_dashboard_task_handle;
+static adc_oneshot_unit_handle_t s_battery_adc_handle;
+static adc_cali_handle_t s_battery_adc_cali_handle;
+static bool s_battery_adc_ready;
+static bool s_battery_adc_calibrated;
 
 static const char *app_state_name(app_state_t state)
 {
@@ -1284,6 +1302,111 @@ static void clear_query_result(query_result_t *result)
     memset(result, 0, sizeof(*result));
 }
 
+static esp_err_t battery_monitor_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = VIBE_BOX_BATTERY_ADC_UNIT,
+    };
+    esp_err_t err = adc_oneshot_new_unit(&unit_cfg, &s_battery_adc_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "battery adc unit init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = VIBE_BOX_BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    err = adc_oneshot_config_channel(s_battery_adc_handle,
+                                     VIBE_BOX_BATTERY_ADC_CHANNEL,
+                                     &chan_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "battery adc channel init failed: %s", esp_err_to_name(err));
+        return err;
+    }
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id = VIBE_BOX_BATTERY_ADC_UNIT,
+        .chan = VIBE_BOX_BATTERY_ADC_CHANNEL,
+        .atten = VIBE_BOX_BATTERY_ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    err = adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_battery_adc_cali_handle);
+    if (err == ESP_OK) {
+        s_battery_adc_calibrated = true;
+    } else {
+        ESP_LOGW(TAG, "battery adc calibration unavailable: %s", esp_err_to_name(err));
+    }
+#else
+    ESP_LOGW(TAG, "battery adc calibration scheme unavailable");
+#endif
+
+    s_battery_adc_ready = true;
+    ESP_LOGI(TAG, "battery monitor ready on ADC1 channel 3");
+    return ESP_OK;
+}
+
+static uint8_t battery_percent_from_mv(int battery_mv)
+{
+    if (battery_mv <= VIBE_BOX_BATTERY_EMPTY_MV) {
+        return 0;
+    }
+    if (battery_mv >= VIBE_BOX_BATTERY_FULL_MV) {
+        return 100;
+    }
+
+    return (uint8_t)(((battery_mv - VIBE_BOX_BATTERY_EMPTY_MV) * 100 +
+                      ((VIBE_BOX_BATTERY_FULL_MV - VIBE_BOX_BATTERY_EMPTY_MV) / 2)) /
+                     (VIBE_BOX_BATTERY_FULL_MV - VIBE_BOX_BATTERY_EMPTY_MV));
+}
+
+static bool battery_read_percent(uint8_t *percent_out, int *battery_mv_out)
+{
+    if (!s_battery_adc_ready || s_battery_adc_handle == NULL || percent_out == NULL) {
+        return false;
+    }
+
+    int64_t pin_mv_sum = 0;
+    int sample_count = 0;
+
+    for (int i = 0; i < VIBE_BOX_BATTERY_SAMPLE_COUNT; ++i) {
+        int raw = 0;
+        esp_err_t err = adc_oneshot_read(s_battery_adc_handle,
+                                         VIBE_BOX_BATTERY_ADC_CHANNEL,
+                                         &raw);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "battery adc read failed: %s", esp_err_to_name(err));
+            continue;
+        }
+
+        int pin_mv = 0;
+        if (s_battery_adc_calibrated && s_battery_adc_cali_handle != NULL) {
+            err = adc_cali_raw_to_voltage(s_battery_adc_cali_handle, raw, &pin_mv);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "battery adc calibration failed: %s", esp_err_to_name(err));
+                continue;
+            }
+        } else {
+            pin_mv = (raw * 3300) / 4095;
+        }
+
+        pin_mv_sum += pin_mv;
+        sample_count++;
+    }
+
+    if (sample_count == 0) {
+        return false;
+    }
+
+    int battery_mv = (int)((pin_mv_sum / sample_count) * VIBE_BOX_BATTERY_DIVIDER_NUM);
+    *percent_out = battery_percent_from_mv(battery_mv);
+    if (battery_mv_out != NULL) {
+        *battery_mv_out = battery_mv;
+    }
+    return true;
+}
+
 static void render_ui_status(app_state_t state, const char *headline, const char *detail)
 {
     memset(&s_ui_snapshot, 0, sizeof(s_ui_snapshot));
@@ -1834,6 +1957,17 @@ static void ui_dashboard_render_once(void)
     y += 3;
 
     /* Wi-Fi block */
+    uint8_t battery_percent = 0;
+    int battery_mv = 0;
+    if (battery_read_percent(&battery_percent, &battery_mv)) {
+        snprintf(line, sizeof(line), "Battery: %u%%", (unsigned)battery_percent);
+        ESP_LOGD(TAG, "battery=%u%% (%dmV)", (unsigned)battery_percent, battery_mv);
+    } else {
+        snprintf(line, sizeof(line), "Battery: --");
+    }
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
     bool connected = wifi_is_connected();
     ui_epaper_draw_text(x, y, connected ? "WiFi: connected" : "WiFi: disconnected");
     y += line_step;
@@ -2066,8 +2200,6 @@ static void confirm_power_on_long_press(void)
 static const char *record_owner_name(record_owner_t owner)
 {
     switch (owner) {
-    case RECORD_OWNER_BOOT:
-        return "BOOT";
     case RECORD_OWNER_TOUCH:
         return "TOUCH";
     case RECORD_OWNER_NONE:
@@ -2211,29 +2343,58 @@ static void handle_press_release_and_upload(record_owner_t owner)
     s_record_owner = RECORD_OWNER_NONE;
 }
 
-static void discard_active_recording(record_owner_t owner)
+static void abort_active_recording(record_owner_t owner, const char *detail)
 {
     if (!audio_input_recording_is_active()) {
         return;
     }
     if (s_record_owner != owner && s_record_owner != RECORD_OWNER_NONE) {
         ESP_LOGW(TAG,
-                 "%s discard ignored; active recording owner is %s",
+                 "%s abort ignored; active recording owner is %s",
                  record_owner_name(owner),
                  record_owner_name(s_record_owner));
         return;
     }
 
-    uint8_t *wav_buf = NULL;
-    size_t wav_size = 0;
-    uint32_t duration_ms = 0;
-    esp_err_t err = audio_input_recording_stop(&wav_buf, &wav_size, &duration_ms);
-    free(wav_buf);
+    esp_err_t err = audio_input_recording_stop(NULL, NULL, NULL);
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "recording abort failed: %s", esp_err_to_name(err));
+    }
+
     s_press_start_ms = 0;
     s_record_owner = RECORD_OWNER_NONE;
-    if (err != ESP_OK && err != ESP_ERR_INVALID_SIZE) {
-        ESP_LOGW(TAG, "discard recording stop failed: %s", esp_err_to_name(err));
+    if (owner == RECORD_OWNER_TOUCH) {
+        s_touch_press_start_ms = 0;
+        s_touch_recording_started = false;
+        s_touch_ignoring_current_press = true;
     }
+    render_ui_status(APP_STATE_IDLE, "Idle", detail);
+}
+
+static bool recover_stuck_touch_recording(void)
+{
+    if (!audio_input_recording_is_active() || s_record_owner != RECORD_OWNER_TOUCH) {
+        return false;
+    }
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t elapsed_ms = s_press_start_ms != 0U ? now_ms - s_press_start_ms : 0U;
+
+    if (!touch_input_is_pressed()) {
+        ESP_LOGW(TAG, "touch release was missed; stopping active recording");
+        s_touch_press_start_ms = 0;
+        s_touch_recording_started = false;
+        handle_press_release_and_upload(RECORD_OWNER_TOUCH);
+        return true;
+    }
+
+    if (elapsed_ms >= VIBE_BOX_RECORDING_MAX_MS + VIBE_BOX_RECORDING_TIMEOUT_GRACE_MS) {
+        ESP_LOGW(TAG, "touch recording timeout after %" PRIu32 "ms; aborting", elapsed_ms);
+        abort_active_recording(RECORD_OWNER_TOUCH, "recording timeout");
+        return true;
+    }
+
+    return false;
 }
 
 static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
@@ -2338,7 +2499,7 @@ static void audio_button_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "press-and-hold trigger ready on BOOT/GPIO%d (active low)",
+    ESP_LOGI(TAG, "restart trigger ready on BOOT/GPIO%d (active low)",
              VIBE_BOX_RECORD_BUTTON_GPIO);
 
     /* Simple debounced edge detector. The button reads 1 when released and 0
@@ -2368,15 +2529,10 @@ static void audio_button_task(void *arg)
                 ESP_LOGI(TAG, "BOOT button pressed");
                 press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
                 restart_fired = false;
-                handle_press_and_hold_recording(RECORD_OWNER_BOOT);
             } else {
                 ESP_LOGI(TAG, "BOOT button released");
                 press_start_ms = 0;
-                if (restart_fired) {
-                    restart_fired = false;
-                } else {
-                    handle_press_release_and_upload(RECORD_OWNER_BOOT);
-                }
+                restart_fired = false;
             }
         }
 
@@ -2386,7 +2542,6 @@ static void audio_button_task(void *arg)
                 restart_fired = true;
                 ESP_LOGI(TAG, "BOOT long-press detected; restarting");
                 render_ui_status(APP_STATE_IDLE, "Restarting", "BOOT long press");
-                discard_active_recording(RECORD_OWNER_BOOT);
                 vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
             }
@@ -2498,6 +2653,7 @@ void app_main(void)
         if (epd_err != ESP_OK) {
             ESP_LOGE(TAG, "ui_epaper_init failed: %s", esp_err_to_name(epd_err));
         } else {
+            (void)battery_monitor_init();
             ui_epaper_show_status("Vibe Box", "boot ok, init...");
             BaseType_t task_ok = xTaskCreatePinnedToCore(
                 ui_dashboard_task, "ui_dash", 4096, NULL, 3, NULL, tskNO_AFFINITY);
@@ -2597,8 +2753,12 @@ void app_main(void)
             }
 
             if (audio_input_recording_is_active()) {
-                /* The BOOT-button task owns the codec/I2S channel right now; leave
-                 * the idle auto-poll out of its way until release+upload finishes. */
+                if (recover_stuck_touch_recording()) {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
+                /* The touch handler owns the codec/I2S channel right now; leave
+                 * the idle loop out of its way until release+upload finishes. */
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
             }
