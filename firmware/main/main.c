@@ -397,6 +397,8 @@ static uint32_t s_touch_last_tap_release_ms;
 static uint32_t s_touch_ignore_until_ms;
 static volatile record_owner_t s_record_owner;
 static volatile bool s_touch_recording_started;
+static volatile bool s_touch_release_pending;
+static volatile bool s_touch_abort_pending;
 static bool s_touch_ignoring_current_press;
 static TaskHandle_t s_ui_dashboard_task_handle;
 static adc_oneshot_unit_handle_t s_battery_adc_handle;
@@ -2959,7 +2961,8 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         s_touch_recording_started = false;
         s_touch_ignoring_current_press = false;
         if (s_record_owner == RECORD_OWNER_TOUCH && audio_input_recording_is_active()) {
-            abort_active_recording(RECORD_OWNER_TOUCH, "swipe cancelled");
+            s_touch_release_pending = false;
+            s_touch_abort_pending = true;
         }
         toggle_translation_enabled(event == TOUCH_EVENT_SWIPE_LEFT ? "swipe left" : "swipe right");
         return;
@@ -3007,7 +3010,11 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         s_touch_recording_started = false;
         if (touch_recording_started) {
             s_touch_last_tap_release_ms = 0;
-            handle_press_release_and_upload(RECORD_OWNER_TOUCH);
+            s_touch_release_pending = true;
+        } else if (s_record_owner == RECORD_OWNER_TOUCH && audio_input_recording_is_active()) {
+            ESP_LOGW(TAG, "touch up arrived after recording flag cleared; stopping from main loop");
+            s_touch_last_tap_release_ms = 0;
+            s_touch_release_pending = true;
         } else {
             handle_touch_tap_enter(release_ms, held_ms);
         }
@@ -3277,6 +3284,19 @@ void app_main(void)
             }
 
             if (audio_input_recording_is_active()) {
+                if (s_touch_abort_pending) {
+                    s_touch_abort_pending = false;
+                    s_touch_release_pending = false;
+                    abort_active_recording(RECORD_OWNER_TOUCH, "swipe cancelled");
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
+                if (s_touch_release_pending) {
+                    s_touch_release_pending = false;
+                    handle_press_release_and_upload(RECORD_OWNER_TOUCH);
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
                 if (recover_stuck_touch_recording()) {
                     vTaskDelay(pdMS_TO_TICKS(200));
                     continue;
