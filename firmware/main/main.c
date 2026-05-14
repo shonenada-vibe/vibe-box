@@ -36,7 +36,6 @@ static const char *TAG = "vibe_box";
 #define WIFI_CONNECTED_BIT BIT0
 #define WIFI_FAIL_BIT      BIT1
 
-#define HEALTH_RESPONSE_BUFFER_SIZE     256
 #define QUERY_RESPONSE_BUFFER_SIZE      16384
 #define FORM_BODY_BUFFER_SIZE           1024
 #define URL_BUFFER_SIZE                 320
@@ -47,6 +46,8 @@ static const char *TAG = "vibe_box";
 #define QUERY_REQUEST_ID_MAX            64
 #define QUERY_DISPLAY_BITMAP_BYTES      UI_EPAPER_FRAME_BUFFER_BYTES
 #define MULTIPART_BOUNDARY              "----VibeBoxBoundary7MA4YWxkTrZu0gW"
+#define MAIN_LOOP_IDLE_MS               10000U
+#define UI_DASHBOARD_REFRESH_MS         60000U
 #define RUNTIME_WIFI_SSID_MAX           33
 #define RUNTIME_WIFI_PASSWORD_MAX       65
 #define RUNTIME_SERVER_BASE_URL_MAX     192
@@ -133,6 +134,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_PWR_LONG_PRESS_MS CONFIG_VIBE_BOX_PWR_LONG_PRESS_MS
 #else
 #define VIBE_BOX_PWR_LONG_PRESS_MS 5000
+#endif
+
+#ifdef CONFIG_VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS
+#define VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS CONFIG_VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS
+#else
+#define VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS 3000
 #endif
 
 #ifdef CONFIG_VIBE_BOX_I2C_SDA_GPIO
@@ -423,7 +430,6 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
              cfg->firmware_version[0] ? cfg->firmware_version : "<empty>");
     ESP_LOGI(TAG, "  language=%s", cfg->language[0] ? cfg->language : "<empty>");
     ESP_LOGI(TAG, "  recording_duration_ms=%" PRIu32, cfg->recording_duration_ms);
-    ESP_LOGI(TAG, "  health_poll_interval_ms=%d", CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
     ESP_LOGI(TAG, "  i2s_capture_enabled=%d", VIBE_BOX_ENABLE_I2S_CAPTURE);
     ESP_LOGI(TAG, "  i2c_port=%d", VIBE_BOX_I2C_PORT);
     ESP_LOGI(TAG, "  i2c_sda_gpio=%d", VIBE_BOX_I2C_SDA_GPIO);
@@ -985,6 +991,7 @@ static esp_err_t wifi_start_station(const runtime_config_t *cfg)
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode sta failed");
     ESP_LOGI(TAG, "applying station config ssid=%s", cfg->wifi_ssid);
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set sta config failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), TAG, "enable wifi power save failed");
     ESP_LOGI(TAG, "starting wifi station");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "start wifi sta failed");
 
@@ -1270,14 +1277,6 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
     }
 
     return ESP_OK;
-}
-
-static esp_err_t health_check_once(const runtime_config_t *cfg)
-{
-    (void)cfg;
-
-    ESP_LOGI(TAG, "network readiness check begin");
-    return wifi_is_connected() ? ESP_OK : ESP_FAIL;
 }
 
 static void clear_query_result(query_result_t *result)
@@ -1734,7 +1733,7 @@ static void stop_provisioning_server(void)
 
 static TickType_t main_loop_delay_ticks(void)
 {
-    return pdMS_TO_TICKS(CONFIG_VIBE_BOX_HEALTH_POLL_INTERVAL_MS);
+    return pdMS_TO_TICKS(MAIN_LOOP_IDLE_MS);
 }
 
 static esp_err_t enter_provisioning_mode(app_state_t *state, const char *reason)
@@ -1799,8 +1798,6 @@ static esp_err_t prepare_audio_capture_pipeline(const runtime_config_t *cfg)
 
     return audio_input_prepare_i2s_capture(&capture_cfg);
 }
-
-#define UI_DASHBOARD_REFRESH_MS 3000
 
 static void ui_dashboard_render_once(void)
 {
@@ -2214,6 +2211,31 @@ static void handle_press_release_and_upload(record_owner_t owner)
     s_record_owner = RECORD_OWNER_NONE;
 }
 
+static void discard_active_recording(record_owner_t owner)
+{
+    if (!audio_input_recording_is_active()) {
+        return;
+    }
+    if (s_record_owner != owner && s_record_owner != RECORD_OWNER_NONE) {
+        ESP_LOGW(TAG,
+                 "%s discard ignored; active recording owner is %s",
+                 record_owner_name(owner),
+                 record_owner_name(s_record_owner));
+        return;
+    }
+
+    uint8_t *wav_buf = NULL;
+    size_t wav_size = 0;
+    uint32_t duration_ms = 0;
+    esp_err_t err = audio_input_recording_stop(&wav_buf, &wav_size, &duration_ms);
+    free(wav_buf);
+    s_press_start_ms = 0;
+    s_record_owner = RECORD_OWNER_NONE;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_SIZE) {
+        ESP_LOGW(TAG, "discard recording stop failed: %s", esp_err_to_name(err));
+    }
+}
+
 static void handle_touch_tap_enter(uint32_t release_ms, uint32_t held_ms)
 {
     if (held_ms == 0U || held_ms > (uint32_t)VIBE_BOX_TOUCH_TAP_MAX_MS) {
@@ -2325,6 +2347,8 @@ static void audio_button_task(void *arg)
     int stable_level = 1;
     int candidate_level = 1;
     int candidate_count = 0;
+    uint32_t press_start_ms = 0;
+    bool restart_fired = false;
 
     while (true) {
         int level = gpio_get_level(VIBE_BOX_RECORD_BUTTON_GPIO);
@@ -2342,10 +2366,29 @@ static void audio_button_task(void *arg)
             stable_level = candidate_level;
             if (stable_level == 0) {
                 ESP_LOGI(TAG, "BOOT button pressed");
+                press_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                restart_fired = false;
                 handle_press_and_hold_recording(RECORD_OWNER_BOOT);
             } else {
                 ESP_LOGI(TAG, "BOOT button released");
-                handle_press_release_and_upload(RECORD_OWNER_BOOT);
+                press_start_ms = 0;
+                if (restart_fired) {
+                    restart_fired = false;
+                } else {
+                    handle_press_release_and_upload(RECORD_OWNER_BOOT);
+                }
+            }
+        }
+
+        if (stable_level == 0 && !restart_fired && press_start_ms != 0U) {
+            uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+            if (now_ms - press_start_ms >= (uint32_t)VIBE_BOX_BOOT_RESTART_LONG_PRESS_MS) {
+                restart_fired = true;
+                ESP_LOGI(TAG, "BOOT long-press detected; restarting");
+                render_ui_status(APP_STATE_IDLE, "Restarting", "BOOT long press");
+                discard_active_recording(RECORD_OWNER_BOOT);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                esp_restart();
             }
         }
 
@@ -2546,8 +2589,6 @@ void app_main(void)
         }
 
         if (state == APP_STATE_IDLE) {
-            esp_err_t err;
-
             if (!wifi_is_connected()) {
                 set_state(&state, APP_STATE_ERROR, "wifi not connected");
                 render_ui_status(state, "Error", "wifi disconnected");
@@ -2560,12 +2601,6 @@ void app_main(void)
                  * the idle auto-poll out of its way until release+upload finishes. */
                 vTaskDelay(pdMS_TO_TICKS(200));
                 continue;
-            }
-
-            err = health_check_once(&s_runtime_config);
-            if (err != ESP_OK) {
-                set_state(&state, APP_STATE_ERROR, "network readiness check failed");
-                render_ui_status(state, "Error", "network failed");
             }
         } else if (state == APP_STATE_PROVISIONING) {
             ESP_LOGI(TAG,
