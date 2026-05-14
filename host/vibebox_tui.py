@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bleak import BleakClient
+from bleak.exc import BleakError
 
 try:
     from vibebox_text_input import (
@@ -106,18 +107,33 @@ class DeviceConfig:
     whisper_api_url: str = ""
     whisper_api_key: str = ""
     stt_model: str = "whisper-large-v3-turbo"
+    openai_api_base: str = ""
+    openai_api_key: str = ""
+    translation_model: str = "gpt-4o-mini"
+    translation_target_language: str = "English"
+    translation_prompt: str = (
+        "You are a translation engine. Translate the user text to the target language. "
+        "Return only the translated text."
+    )
+    translation_enabled: bool = False
     device_id: str = "vibe-box-dev"
     firmware_version: str = "dev"
     language: str = "zh"
     recording_duration_ms: int = 3000
 
-    def as_ble_payload(self) -> dict[str, str | int]:
+    def as_ble_payload(self) -> dict[str, str | int | bool]:
         return {
             "wifi_ssid": self.wifi_ssid,
             "wifi_password": self.wifi_password,
             "whisper_api_url": self.whisper_api_url,
             "whisper_api_key": self.whisper_api_key,
             "stt_model": self.stt_model,
+            "openai_api_base": self.openai_api_base,
+            "openai_api_key": self.openai_api_key,
+            "translation_model": self.translation_model,
+            "translation_target_language": self.translation_target_language,
+            "translation_prompt": self.translation_prompt,
+            "translation_enabled": self.translation_enabled,
             "device_id": self.device_id,
             "firmware_version": self.firmware_version,
             "language": self.language,
@@ -133,6 +149,16 @@ def device_config_from_json(payload: str) -> DeviceConfig:
         whisper_api_url=values.get("whisper_api_url", ""),
         whisper_api_key=values.get("whisper_api_key", ""),
         stt_model=values.get("stt_model", "whisper-large-v3-turbo"),
+        openai_api_base=values.get("openai_api_base", ""),
+        openai_api_key=values.get("openai_api_key", ""),
+        translation_model=values.get("translation_model", "gpt-4o-mini"),
+        translation_target_language=values.get("translation_target_language", "English"),
+        translation_prompt=values.get(
+            "translation_prompt",
+            "You are a translation engine. Translate the user text to the target language. "
+            "Return only the translated text.",
+        ),
+        translation_enabled=bool(values.get("translation_enabled", False)),
         device_id=values.get("device_id", "vibe-box-dev"),
         firmware_version=values.get("firmware_version", "dev"),
         language=values.get("language", "zh"),
@@ -235,6 +261,12 @@ DEVICE_FIELDS = [
     ("whisper_api_url", "Whisper API URL", False),
     ("whisper_api_key", "Whisper API key", True),
     ("stt_model", "STT model", False),
+    ("openai_api_base", "OpenAI API base", False),
+    ("openai_api_key", "OpenAI API key", True),
+    ("translation_model", "Translation model", False),
+    ("translation_target_language", "Translation target", False),
+    ("translation_prompt", "Translation prompt", False),
+    ("translation_enabled", "Translation enabled", False),
     ("device_id", "Device ID", False),
     ("firmware_version", "Firmware version", False),
     ("language", "Language", False),
@@ -410,6 +442,11 @@ def edit_host_field(stdscr, state: TuiState) -> None:
 def edit_device_field(stdscr, state: TuiState) -> None:
     key, label, secret = DEVICE_FIELDS[state.selected[1]]
     current = getattr(state.device_config, key)
+    if isinstance(current, bool):
+        setattr(state.device_config, key, not current)
+        state.log(f"{label} staged: {display_value(getattr(state.device_config, key))}")
+        return
+
     next_value = prompt(stdscr, label, str(current), secret=secret)
     if next_value is None:
         return
@@ -463,6 +500,11 @@ async def send_config_packets_with_active_client(state: TuiState, packets: list[
             await state.ble_client.write_gatt_char(state.host_config.config_char_uuid, packet, response=True)
             await asyncio.sleep(0.01)
         return await asyncio.wait_for(state.config_response_future, BLE_CONFIG_TIMEOUT_SECONDS)
+    except BleakError as exc:
+        state.ble_client = None
+        state.ble_config_ready = False
+        state.ble_status = "waiting"
+        raise RuntimeError(f"BLE disconnected during config transaction: {exc}") from exc
     finally:
         state.config_response_future = None
 
@@ -495,9 +537,15 @@ async def send_config_packets_with_temp_client(
 
 
 async def ble_config_transaction(state: TuiState, packets: list[bytes]) -> tuple[bool, str]:
-    if state.ble_client is not None and state.ble_client.is_connected:
-        return await send_config_packets_with_active_client(state, packets)
-    return await send_config_packets_with_temp_client(state.host_config, packets, state.log)
+    try:
+        if state.ble_client is not None and state.ble_client.is_connected:
+            return await send_config_packets_with_active_client(state, packets)
+        return await send_config_packets_with_temp_client(state.host_config, packets, state.log)
+    except BleakError as exc:
+        state.ble_client = None
+        state.ble_config_ready = False
+        state.ble_status = "waiting"
+        raise RuntimeError(f"BLE config transaction failed: {exc}") from exc
 
 
 async def fetch_device_config_ble(state: TuiState) -> DeviceConfig:
