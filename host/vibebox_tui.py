@@ -50,6 +50,16 @@ CONFIG_OPCODE_RESP_CHUNK = 0x82
 CONFIG_OPCODE_RESP_END = 0x83
 CONFIG_OPCODE_RESP_ERROR = 0x84
 BLE_PACKET_PAYLOAD_MAX = 19
+DEFAULT_TRANSLATION_PROMPT = (
+    "You are a translation engine. Translate the user text to the target language. "
+    "Return only the translated text."
+)
+DEFAULT_REFINE_PROMPT = (
+    "You are a text refinement engine. Rewrite the text to be fluent and natural while preserving "
+    "the user's final intent. Remove filler words, repeated phrases, false starts, and "
+    "self-corrections. If the speaker corrects themselves, keep only the corrected final meaning. "
+    "Return only the refined text."
+)
 BLE_CONFIG_TIMEOUT_SECONDS = 12.0
 
 
@@ -111,11 +121,10 @@ class DeviceConfig:
     openai_api_key: str = ""
     translation_model: str = "gpt-4o-mini"
     translation_target_language: str = "English"
-    translation_prompt: str = (
-        "You are a translation engine. Translate the user text to the target language. "
-        "Return only the translated text."
-    )
+    translation_prompt: str = DEFAULT_TRANSLATION_PROMPT
     translation_enabled: bool = False
+    refine_prompt: str = DEFAULT_REFINE_PROMPT
+    refine_enabled: bool = False
     device_id: str = "vibe-box-dev"
     firmware_version: str = "dev"
     language: str = "zh"
@@ -134,6 +143,8 @@ class DeviceConfig:
             "translation_target_language": self.translation_target_language,
             "translation_prompt": self.translation_prompt,
             "translation_enabled": self.translation_enabled,
+            "refine_prompt": self.refine_prompt,
+            "refine_enabled": self.refine_enabled,
             "device_id": self.device_id,
             "firmware_version": self.firmware_version,
             "language": self.language,
@@ -153,12 +164,10 @@ def device_config_from_json(payload: str) -> DeviceConfig:
         openai_api_key=values.get("openai_api_key", ""),
         translation_model=values.get("translation_model", "gpt-4o-mini"),
         translation_target_language=values.get("translation_target_language", "English"),
-        translation_prompt=values.get(
-            "translation_prompt",
-            "You are a translation engine. Translate the user text to the target language. "
-            "Return only the translated text.",
-        ),
+        translation_prompt=values.get("translation_prompt", DEFAULT_TRANSLATION_PROMPT),
         translation_enabled=bool(values.get("translation_enabled", False)),
+        refine_prompt=values.get("refine_prompt", DEFAULT_REFINE_PROMPT),
+        refine_enabled=bool(values.get("refine_enabled", False)),
         device_id=values.get("device_id", "vibe-box-dev"),
         firmware_version=values.get("firmware_version", "dev"),
         language=values.get("language", "zh"),
@@ -267,6 +276,8 @@ DEVICE_FIELDS = [
     ("translation_target_language", "Translation target", False),
     ("translation_prompt", "Translation prompt", False),
     ("translation_enabled", "Translation enabled", False),
+    ("refine_prompt", "Refine prompt", False),
+    ("refine_enabled", "Refine enabled", False),
     ("device_id", "Device ID", False),
     ("firmware_version", "Firmware version", False),
     ("language", "Language", False),

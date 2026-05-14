@@ -90,6 +90,12 @@ config VIBE_BOX_TRANSLATION_PROMPT
     help
         System prompt sent with each translation request.
 
+config VIBE_BOX_REFINE_PROMPT
+    string "Refine system prompt"
+    default "You are a text refinement engine. Rewrite the text to be fluent and natural while preserving the user's final intent. Remove filler words, repeated phrases, false starts, and self-corrections. If the speaker corrects themselves, keep only the corrected final meaning. Return only the refined text."
+    help
+        System prompt sent with each text refinement request.
+
 config VIBE_BOX_DEVICE_ID
     string "Device ID"
     default "vibe-box-dev"

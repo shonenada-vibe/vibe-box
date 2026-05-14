@@ -63,6 +63,7 @@ static const char *TAG = "vibe_box";
 #define RUNTIME_TRANSLATION_MODEL_MAX   96
 #define RUNTIME_TRANSLATION_LANGUAGE_MAX 32
 #define RUNTIME_TRANSLATION_PROMPT_MAX  512
+#define RUNTIME_REFINE_PROMPT_MAX       512
 #define RUNTIME_DEVICE_ID_MAX           64
 #define RUNTIME_FIRMWARE_VERSION_MAX    64
 #define RUNTIME_LANGUAGE_MAX            16
@@ -124,6 +125,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_DEFAULT_TRANSLATION_PROMPT CONFIG_VIBE_BOX_TRANSLATION_PROMPT
 #else
 #define VIBE_BOX_DEFAULT_TRANSLATION_PROMPT "You are a translation engine. Translate the user text to the target language. Return only the translated text."
+#endif
+
+#ifdef CONFIG_VIBE_BOX_REFINE_PROMPT
+#define VIBE_BOX_DEFAULT_REFINE_PROMPT CONFIG_VIBE_BOX_REFINE_PROMPT
+#else
+#define VIBE_BOX_DEFAULT_REFINE_PROMPT "You are a text refinement engine. Rewrite the text to be fluent and natural while preserving the user's final intent. Remove filler words, repeated phrases, false starts, and self-corrections. If the speaker corrects themselves, keep only the corrected final meaning. Return only the refined text."
 #endif
 
 #ifdef CONFIG_VIBE_BOX_LANGUAGE
@@ -351,7 +358,9 @@ typedef struct {
     char translation_model[RUNTIME_TRANSLATION_MODEL_MAX];
     char translation_target_language[RUNTIME_TRANSLATION_LANGUAGE_MAX];
     char translation_prompt[RUNTIME_TRANSLATION_PROMPT_MAX];
+    char refine_prompt[RUNTIME_REFINE_PROMPT_MAX];
     bool translation_enabled;
+    bool refine_enabled;
     char device_id[RUNTIME_DEVICE_ID_MAX];
     char firmware_version[RUNTIME_FIRMWARE_VERSION_MAX];
     char language[RUNTIME_LANGUAGE_MAX];
@@ -474,7 +483,11 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
     strlcpy(cfg->translation_prompt,
             VIBE_BOX_DEFAULT_TRANSLATION_PROMPT,
             sizeof(cfg->translation_prompt));
+    strlcpy(cfg->refine_prompt,
+            VIBE_BOX_DEFAULT_REFINE_PROMPT,
+            sizeof(cfg->refine_prompt));
     cfg->translation_enabled = false;
+    cfg->refine_enabled = false;
     strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
     strlcpy(cfg->firmware_version,
             CONFIG_VIBE_BOX_FIRMWARE_VERSION,
@@ -508,6 +521,7 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
              "  translation_target_language=%s",
              cfg->translation_target_language[0] ? cfg->translation_target_language : "<empty>");
     ESP_LOGI(TAG, "  translation_enabled=%d", cfg->translation_enabled);
+    ESP_LOGI(TAG, "  refine_enabled=%d", cfg->refine_enabled);
     ESP_LOGI(TAG, "  device_id=%s", cfg->device_id[0] ? cfg->device_id : "<empty>");
     ESP_LOGI(TAG,
              "  firmware_version=%s",
@@ -593,11 +607,22 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
                                "tr_prompt",
                                cfg->translation_prompt,
                                sizeof(cfg->translation_prompt));
+    nvs_load_string_or_default(handle,
+                               "rf_prompt",
+                               cfg->refine_prompt,
+                               sizeof(cfg->refine_prompt));
     {
         uint8_t enabled = 0;
 
         if (nvs_get_u8(handle, "tr_en", &enabled) == ESP_OK) {
             cfg->translation_enabled = enabled != 0U;
+        }
+    }
+    {
+        uint8_t enabled = 0;
+
+        if (nvs_get_u8(handle, "rf_en", &enabled) == ESP_OK) {
+            cfg->refine_enabled = enabled != 0U;
         }
     }
     nvs_load_string_or_default(handle, "device_id", cfg->device_id, sizeof(cfg->device_id));
@@ -687,6 +712,16 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
     err = nvs_set_u8(handle, "tr_en", cfg->translation_enabled ? 1U : 0U);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "save tr_en failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "rf_prompt", cfg->refine_prompt);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save rf_prompt failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u8(handle, "rf_en", cfg->refine_enabled ? 1U : 0U);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save rf_en failed: %s", esp_err_to_name(err));
         goto exit;
     }
     err = nvs_set_str(handle, "device_id", cfg->device_id);
@@ -792,6 +827,8 @@ static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, 
                                 cfg->translation_target_language) == NULL ||
         cJSON_AddStringToObject(root, "translation_prompt", cfg->translation_prompt) == NULL ||
         cJSON_AddBoolToObject(root, "translation_enabled", cfg->translation_enabled) == NULL ||
+        cJSON_AddStringToObject(root, "refine_prompt", cfg->refine_prompt) == NULL ||
+        cJSON_AddBoolToObject(root, "refine_enabled", cfg->refine_enabled) == NULL ||
         cJSON_AddStringToObject(root, "device_id", cfg->device_id) == NULL ||
         cJSON_AddStringToObject(root, "firmware_version", cfg->firmware_version) == NULL ||
         cJSON_AddStringToObject(root, "language", cfg->language) == NULL ||
@@ -850,6 +887,11 @@ static void fill_runtime_config_defaults(runtime_config_t *cfg)
         strlcpy(cfg->translation_prompt,
                 VIBE_BOX_DEFAULT_TRANSLATION_PROMPT,
                 sizeof(cfg->translation_prompt));
+    }
+    if (cfg->refine_prompt[0] == '\0') {
+        strlcpy(cfg->refine_prompt,
+                VIBE_BOX_DEFAULT_REFINE_PROMPT,
+                sizeof(cfg->refine_prompt));
     }
     if (cfg->recording_duration_ms == 0U) {
         cfg->recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
@@ -914,6 +956,12 @@ static esp_err_t runtime_config_update_from_json(const char *json, runtime_confi
                           sizeof(next_config->translation_prompt),
                           false) ||
         !json_copy_bool(root, "translation_enabled", &next_config->translation_enabled) ||
+        !json_copy_string(root,
+                          "refine_prompt",
+                          next_config->refine_prompt,
+                          sizeof(next_config->refine_prompt),
+                          false) ||
+        !json_copy_bool(root, "refine_enabled", &next_config->refine_enabled) ||
         !json_copy_string(root, "device_id", next_config->device_id, sizeof(next_config->device_id), false) ||
         !json_copy_string(root,
                           "firmware_version",
@@ -1702,6 +1750,25 @@ static bool openai_api_base_is_deepseek(const char *api_base)
     return api_base != NULL && strstr(api_base, "deepseek.com") != NULL;
 }
 
+static esp_err_t add_deepseek_thinking_if_needed(const runtime_config_t *cfg, cJSON *root)
+{
+    cJSON *thinking = NULL;
+
+    if (cfg == NULL || root == NULL || !openai_api_base_is_deepseek(cfg->openai_api_base)) {
+        return ESP_OK;
+    }
+
+    thinking = cJSON_CreateObject();
+    if (thinking == NULL ||
+        cJSON_AddStringToObject(thinking, "type", "disabled") == NULL ||
+        !cJSON_AddItemToObject(root, "thinking", thinking)) {
+        cJSON_Delete(thinking);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
+
 static const char *chat_response_content(const char *response_body)
 {
     cJSON *root = cJSON_Parse(response_body);
@@ -1746,7 +1813,6 @@ static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
     cJSON *messages = NULL;
     cJSON *system_msg = NULL;
     cJSON *user_msg = NULL;
-    cJSON *thinking = NULL;
     char user_content[QUERY_TEXT_MAX + RUNTIME_TRANSLATION_LANGUAGE_MAX + 64];
     char *printed = NULL;
     esp_err_t err = ESP_OK;
@@ -1780,15 +1846,9 @@ static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
         goto cleanup;
     }
 
-    if (openai_api_base_is_deepseek(cfg->openai_api_base)) {
-        thinking = cJSON_CreateObject();
-        if (thinking == NULL ||
-            cJSON_AddStringToObject(thinking, "type", "disabled") == NULL ||
-            !cJSON_AddItemToObject(root, "thinking", thinking)) {
-            err = ESP_ERR_NO_MEM;
-            goto cleanup;
-        }
-        thinking = NULL;
+    err = add_deepseek_thinking_if_needed(cfg, root);
+    if (err != ESP_OK) {
+        goto cleanup;
     }
 
     if (!cJSON_AddItemToArray(messages, system_msg)) {
@@ -1822,7 +1882,84 @@ cleanup:
     }
     cJSON_Delete(system_msg);
     cJSON_Delete(user_msg);
-    cJSON_Delete(thinking);
+    cJSON_Delete(messages);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t build_refine_request_body(const runtime_config_t *cfg,
+                                           const char *text,
+                                           char **body_out)
+{
+    cJSON *root = NULL;
+    cJSON *messages = NULL;
+    cJSON *system_msg = NULL;
+    cJSON *user_msg = NULL;
+    char user_content[QUERY_REPLY_MAX + 16];
+    char *printed = NULL;
+    esp_err_t err = ESP_OK;
+
+    if (cfg == NULL || text == NULL || text[0] == '\0' || body_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    root = cJSON_CreateObject();
+    messages = cJSON_CreateArray();
+    system_msg = cJSON_CreateObject();
+    user_msg = cJSON_CreateObject();
+    if (root == NULL || messages == NULL || system_msg == NULL || user_msg == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    snprintf(user_content, sizeof(user_content), "Text:\n%s", text);
+
+    if (cJSON_AddStringToObject(root, "model", cfg->translation_model) == NULL ||
+        cJSON_AddNumberToObject(root, "temperature", 0) == NULL ||
+        cJSON_AddStringToObject(system_msg, "role", "system") == NULL ||
+        cJSON_AddStringToObject(system_msg, "content", cfg->refine_prompt) == NULL ||
+        cJSON_AddStringToObject(user_msg, "role", "user") == NULL ||
+        cJSON_AddStringToObject(user_msg, "content", user_content) == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    err = add_deepseek_thinking_if_needed(cfg, root);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+
+    if (!cJSON_AddItemToArray(messages, system_msg)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    system_msg = NULL;
+    if (!cJSON_AddItemToArray(messages, user_msg)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    user_msg = NULL;
+    if (!cJSON_AddItemToObject(root, "messages", messages)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    messages = NULL;
+
+    printed = cJSON_PrintUnformatted(root);
+    if (printed == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    *body_out = printed;
+    printed = NULL;
+
+cleanup:
+    if (printed != NULL) {
+        cJSON_free(printed);
+    }
+    cJSON_Delete(system_msg);
+    cJSON_Delete(user_msg);
     cJSON_Delete(messages);
     cJSON_Delete(root);
     return err;
@@ -1885,6 +2022,77 @@ static esp_err_t translate_query_result(const runtime_config_t *cfg, query_resul
     strlcpy(result->display_lines[0], translated, sizeof(result->display_lines[0]));
     result->display_line_count = 1U;
     ESP_LOGI(TAG, "translation result=%s", result->reply_text);
+
+cleanup:
+    if (request_body != NULL) {
+        cJSON_free(request_body);
+    }
+    free(response_buf);
+    return err;
+}
+
+static esp_err_t refine_query_result(const runtime_config_t *cfg, query_result_t *result)
+{
+    char url[URL_BUFFER_SIZE];
+    char *request_body = NULL;
+    char *response_buf = NULL;
+    const char *source_text;
+    const char *refined;
+    int status = 0;
+    esp_err_t err;
+
+    if (cfg == NULL || result == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    source_text = result->reply_text[0] != '\0' ? result->reply_text : result->transcript;
+    if (source_text == NULL || source_text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (cfg->openai_api_base[0] == '\0' || cfg->translation_model[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    err = build_openai_chat_url(cfg->openai_api_base, url, sizeof(url));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    response_buf = calloc(1, QUERY_RESPONSE_BUFFER_SIZE);
+    if (response_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    err = build_refine_request_body(cfg, source_text, &request_body);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+
+    err = perform_http_request(cfg,
+                               url,
+                               HTTP_METHOD_POST,
+                               "application/json",
+                               cfg->openai_api_key,
+                               (const uint8_t *)request_body,
+                               strlen(request_body),
+                               response_buf,
+                               QUERY_RESPONSE_BUFFER_SIZE,
+                               &status);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "refine request failed status=%d err=%s",
+                 status, esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    refined = chat_response_content(response_buf);
+    if (refined == NULL || refined[0] == '\0') {
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    strlcpy(result->reply_text, refined, sizeof(result->reply_text));
+    strlcpy(result->display_lines[0], refined, sizeof(result->display_lines[0]));
+    result->display_line_count = 1U;
+    ESP_LOGI(TAG, "refine result=%s", result->reply_text);
 
 cleanup:
     if (request_body != NULL) {
@@ -2095,6 +2303,8 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "<label>Translation Target Language</label><input name='translation_target_language' value='%s' maxlength='31' />"
         "<label>Translation Prompt</label><textarea name='translation_prompt' maxlength='511'>%s</textarea>"
         "<label><input name='translation_enabled' type='checkbox' value='1' %s /> Enable Translation</label>"
+        "<label>Refine Prompt</label><textarea name='refine_prompt' maxlength='511'>%s</textarea>"
+        "<label><input name='refine_enabled' type='checkbox' value='1' %s /> Enable Refine</label>"
         "<label>Device ID</label><input name='device_id' value='%s' maxlength='63' />"
         "<label>Firmware Version</label><input name='firmware_version' value='%s' maxlength='63' />"
         "<label>Language</label><input name='language' value='%s' maxlength='15' />"
@@ -2113,6 +2323,8 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         s_runtime_config.translation_target_language,
         s_runtime_config.translation_prompt,
         s_runtime_config.translation_enabled ? "checked" : "",
+        s_runtime_config.refine_prompt,
+        s_runtime_config.refine_enabled ? "checked" : "",
         s_runtime_config.device_id,
         s_runtime_config.firmware_version,
         s_runtime_config.language,
@@ -2133,7 +2345,7 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              "\"whisper_api_key_configured\":%s,\"stt_model\":\"%s\","
              "\"openai_api_base\":\"%s\",\"openai_api_key_configured\":%s,"
              "\"translation_model\":\"%s\",\"translation_target_language\":\"%s\","
-             "\"translation_enabled\":%s,"
+             "\"translation_enabled\":%s,\"refine_enabled\":%s,"
              "\"device_id\":\"%s\",\"firmware_version\":\"%s\","
              "\"language\":\"%s\",\"recording_duration_ms\":%" PRIu32 "}",
              app_state_name(APP_STATE_PROVISIONING),
@@ -2146,6 +2358,7 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              s_runtime_config.translation_model,
              s_runtime_config.translation_target_language,
              s_runtime_config.translation_enabled ? "true" : "false",
+             s_runtime_config.refine_enabled ? "true" : "false",
              s_runtime_config.device_id,
              s_runtime_config.firmware_version,
              s_runtime_config.language,
@@ -2217,6 +2430,11 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
                        next_config.translation_prompt,
                        sizeof(next_config.translation_prompt));
     next_config.translation_enabled = strstr(body, "translation_enabled=1") != NULL;
+    extract_form_value(body,
+                       "refine_prompt",
+                       next_config.refine_prompt,
+                       sizeof(next_config.refine_prompt));
+    next_config.refine_enabled = strstr(body, "refine_enabled=1") != NULL;
     extract_form_value(body, "device_id", next_config.device_id, sizeof(next_config.device_id));
     extract_form_value(body,
                        "firmware_version",
@@ -2258,6 +2476,11 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
         strlcpy(next_config.translation_prompt,
                 VIBE_BOX_DEFAULT_TRANSLATION_PROMPT,
                 sizeof(next_config.translation_prompt));
+    }
+    if (next_config.refine_prompt[0] == '\0') {
+        strlcpy(next_config.refine_prompt,
+                VIBE_BOX_DEFAULT_REFINE_PROMPT,
+                sizeof(next_config.refine_prompt));
     }
     if (next_config.recording_duration_ms == 0U) {
         next_config.recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
@@ -2514,6 +2737,10 @@ static void ui_dashboard_render_once(void)
              "Translate: %s %.12s",
              s_runtime_config.translation_enabled ? "on" : "off",
              s_runtime_config.translation_target_language);
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    snprintf(line, sizeof(line), "Refine: %s", s_runtime_config.refine_enabled ? "on" : "off");
     ui_epaper_draw_text(x, y, line);
     y += line_step;
 
@@ -2812,6 +3039,13 @@ static void handle_press_release_and_upload(record_owner_t owner)
             esp_err_t tr_err = translate_query_result(&s_runtime_config, &s_last_query_result);
             if (tr_err != ESP_OK) {
                 ESP_LOGW(TAG, "translation skipped/failed: %s", esp_err_to_name(tr_err));
+            }
+        }
+        if (s_runtime_config.refine_enabled) {
+            render_ui_status(APP_STATE_UPLOADING, "Refining", "polishing text");
+            esp_err_t rf_err = refine_query_result(&s_runtime_config, &s_last_query_result);
+            if (rf_err != ESP_OK) {
+                ESP_LOGW(TAG, "refine skipped/failed: %s", esp_err_to_name(rf_err));
             }
         }
         log_query_result(&s_last_query_result);
