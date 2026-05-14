@@ -1695,11 +1695,9 @@ static esp_err_t build_openai_chat_url(const char *api_base, char *dst, size_t d
     return ESP_OK;
 }
 
-static bool openai_api_base_is_official(const char *api_base)
+static bool openai_api_base_is_deepseek(const char *api_base)
 {
-    return api_base != NULL &&
-           (strstr(api_base, "://api.openai.com/") != NULL ||
-            strstr(api_base, "://api.openai.com") != NULL);
+    return api_base != NULL && strstr(api_base, "deepseek.com") != NULL;
 }
 
 static const char *chat_response_content(const char *response_body)
@@ -1746,6 +1744,7 @@ static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
     cJSON *messages = NULL;
     cJSON *system_msg = NULL;
     cJSON *user_msg = NULL;
+    cJSON *thinking = NULL;
     char user_content[QUERY_TEXT_MAX + RUNTIME_TRANSLATION_LANGUAGE_MAX + 64];
     char *printed = NULL;
     esp_err_t err = ESP_OK;
@@ -1771,8 +1770,6 @@ static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
 
     if (cJSON_AddStringToObject(root, "model", cfg->translation_model) == NULL ||
         cJSON_AddNumberToObject(root, "temperature", 0) == NULL ||
-        (!openai_api_base_is_official(cfg->openai_api_base) &&
-         cJSON_AddBoolToObject(root, "enable_thinking", false) == NULL) ||
         cJSON_AddStringToObject(system_msg, "role", "system") == NULL ||
         cJSON_AddStringToObject(system_msg, "content", cfg->translation_prompt) == NULL ||
         cJSON_AddStringToObject(user_msg, "role", "user") == NULL ||
@@ -1780,6 +1777,18 @@ static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
         err = ESP_ERR_NO_MEM;
         goto cleanup;
     }
+
+    if (openai_api_base_is_deepseek(cfg->openai_api_base)) {
+        thinking = cJSON_CreateObject();
+        if (thinking == NULL ||
+            cJSON_AddStringToObject(thinking, "type", "disabled") == NULL ||
+            !cJSON_AddItemToObject(root, "thinking", thinking)) {
+            err = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+        thinking = NULL;
+    }
+
     if (!cJSON_AddItemToArray(messages, system_msg)) {
         err = ESP_ERR_NO_MEM;
         goto cleanup;
@@ -1811,6 +1820,7 @@ cleanup:
     }
     cJSON_Delete(system_msg);
     cJSON_Delete(user_msg);
+    cJSON_Delete(thinking);
     cJSON_Delete(messages);
     cJSON_Delete(root);
     return err;
