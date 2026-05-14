@@ -45,6 +45,9 @@ esp_err_t touch_input_init(const touch_input_config_t *cfg,
 /* Returns true if a finger is currently considered pressed (post-debounce). */
 bool touch_input_is_pressed(void);
 
+/* Returns the most recent touch coordinate reported by the controller. */
+bool touch_input_get_last_point(uint16_t *x, uint16_t *y);
+
 #ifdef __cplusplus
 }
 #endif

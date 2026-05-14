@@ -487,6 +487,27 @@ void ui_epaper_draw_hline(int y, int x0, int x1)
     }
 }
 
+void ui_epaper_draw_vline(int x, int y0, int y1)
+{
+    if (s_frame_buffer == NULL) {
+        return;
+    }
+    if (y0 > y1) {
+        int tmp = y0; y0 = y1; y1 = tmp;
+    }
+    for (int y = y0; y <= y1; ++y) {
+        draw_pixel_black(x, y);
+    }
+}
+
+void ui_epaper_draw_rect(int x0, int y0, int x1, int y1)
+{
+    ui_epaper_draw_hline(y0, x0, x1);
+    ui_epaper_draw_hline(y1, x0, x1);
+    ui_epaper_draw_vline(x0, y0, y1);
+    ui_epaper_draw_vline(x1, y0, y1);
+}
+
 esp_err_t ui_epaper_flush(void)
 {
     if (!s_initialized) {
