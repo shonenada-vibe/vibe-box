@@ -343,7 +343,9 @@ typedef enum {
     APP_STATE_PROVISIONING,
     APP_STATE_IDLE,
     APP_STATE_RECORDING,
-    APP_STATE_UPLOADING,
+    APP_STATE_TRANSCRIPTING,
+    APP_STATE_TRANSLATING,
+    APP_STATE_REFINING,
     APP_STATE_DISPLAYING,
     APP_STATE_ERROR,
 } app_state_t;
@@ -430,8 +432,12 @@ static const char *app_state_name(app_state_t state)
         return "idle";
     case APP_STATE_RECORDING:
         return "recording";
-    case APP_STATE_UPLOADING:
-        return "uploading";
+    case APP_STATE_TRANSCRIPTING:
+        return "transcripting";
+    case APP_STATE_TRANSLATING:
+        return "translating";
+    case APP_STATE_REFINING:
+        return "refining";
     case APP_STATE_DISPLAYING:
         return "displaying";
     case APP_STATE_ERROR:
@@ -3073,14 +3079,14 @@ static void handle_press_release_and_upload(record_owner_t owner)
 
     if (!wifi_is_connected()) {
         s_record_owner = RECORD_OWNER_NONE;
-        render_ui_status(APP_STATE_ERROR, "Upload", "wifi disconnected");
+        render_ui_status(APP_STATE_ERROR, "Transcript", "wifi disconnected");
         free(wav_buf);
         return;
     }
 
     char detail[64];
-    snprintf(detail, sizeof(detail), "uploading %" PRIu32 " ms", duration_ms);
-    render_ui_status(APP_STATE_UPLOADING, "Uploading", detail);
+    snprintf(detail, sizeof(detail), "audio %" PRIu32 " ms", duration_ms);
+    render_ui_status(APP_STATE_TRANSCRIPTING, "Transcripting", detail);
 
     err = upload_wav_and_parse(&s_runtime_config, wav_buf, wav_size, &s_last_query_result);
     free(wav_buf);
@@ -3092,14 +3098,14 @@ static void handle_press_release_and_upload(record_owner_t owner)
                      sizeof(translate_detail),
                      "to %.40s",
                      s_runtime_config.translation_target_language);
-            render_ui_status(APP_STATE_UPLOADING, "Translating", translate_detail);
+            render_ui_status(APP_STATE_TRANSLATING, "Translating", translate_detail);
             esp_err_t tr_err = translate_query_result(&s_runtime_config, &s_last_query_result);
             if (tr_err != ESP_OK) {
                 ESP_LOGW(TAG, "translation skipped/failed: %s", esp_err_to_name(tr_err));
             }
         }
         if (s_runtime_config.refine_enabled) {
-            render_ui_status(APP_STATE_UPLOADING, "Refining", "polishing text");
+            render_ui_status(APP_STATE_REFINING, "Refining", "polishing text");
             esp_err_t rf_err = refine_query_result(&s_runtime_config, &s_last_query_result);
             if (rf_err != ESP_OK) {
                 ESP_LOGW(TAG, "refine skipped/failed: %s", esp_err_to_name(rf_err));
@@ -3120,7 +3126,7 @@ static void handle_press_release_and_upload(record_owner_t owner)
         render_ui_query_result(&s_last_query_result);
         render_ui_status(APP_STATE_IDLE, "Idle", "ready for next take");
     } else {
-        render_ui_status(APP_STATE_ERROR, "Upload", esp_err_to_name(err));
+        render_ui_status(APP_STATE_ERROR, "Transcript", esp_err_to_name(err));
     }
     s_record_owner = RECORD_OWNER_NONE;
 }
@@ -3633,7 +3639,9 @@ void app_main(void)
 
     while (true) {
         if (s_runtime_config_reconnect_requested && state != APP_STATE_RECORDING &&
-            state != APP_STATE_UPLOADING) {
+            state != APP_STATE_TRANSCRIPTING &&
+            state != APP_STATE_TRANSLATING &&
+            state != APP_STATE_REFINING) {
             s_runtime_config_reconnect_requested = false;
             s_provisioning_reconnect_requested = false;
             if (!runtime_config_is_complete(&s_runtime_config)) {
