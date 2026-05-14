@@ -1695,6 +1695,13 @@ static esp_err_t build_openai_chat_url(const char *api_base, char *dst, size_t d
     return ESP_OK;
 }
 
+static bool openai_api_base_is_official(const char *api_base)
+{
+    return api_base != NULL &&
+           (strstr(api_base, "://api.openai.com/") != NULL ||
+            strstr(api_base, "://api.openai.com") != NULL);
+}
+
 static const char *chat_response_content(const char *response_body)
 {
     cJSON *root = cJSON_Parse(response_body);
@@ -1764,6 +1771,8 @@ static esp_err_t build_translation_request_body(const runtime_config_t *cfg,
 
     if (cJSON_AddStringToObject(root, "model", cfg->translation_model) == NULL ||
         cJSON_AddNumberToObject(root, "temperature", 0) == NULL ||
+        (!openai_api_base_is_official(cfg->openai_api_base) &&
+         cJSON_AddBoolToObject(root, "enable_thinking", false) == NULL) ||
         cJSON_AddStringToObject(system_msg, "role", "system") == NULL ||
         cJSON_AddStringToObject(system_msg, "content", cfg->translation_prompt) == NULL ||
         cJSON_AddStringToObject(user_msg, "role", "user") == NULL ||
