@@ -210,13 +210,19 @@ static uint8_t es8311_dac_volume_reg(uint8_t volume_percent)
 
 static esp_err_t es8311_start_dac(uint8_t volume_percent, bool muted)
 {
-    /* Keep the codec setup aligned with the ADC path, but unmute the DAC
-     * serial input (REG09 bit 6) and power up the DAC analog/digital blocks. */
+    /* Mirrors es8311_start(ES_MODULE_DAC) from esp-adf: clear the SDP DAC
+     * mute (REG09 bit 6) and the SDP ADC mute (REG0A bit 6), then power up
+     * the analog/digital blocks. REG17 is part of the canonical bring-up
+     * even in DAC-only mode -- without it the analog reference stays in a
+     * post-reset state that produces silence on a fresh boot when no ADC
+     * capture has primed the codec. */
     ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SDPIN_REG09, 0x40, 0x00), TAG, "unmute dac failed");
-    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0x01), TAG, "reg0d digital pwr failed");
+    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SDPOUT_REG0A, 0x40, 0x00), TAG, "unmute adc sdp failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_ADC_REG17, 0xBF), TAG, "reg17 adc vol failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0E, 0x02), TAG, "reg0e analog pwr failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG12, 0x00), TAG, "reg12 pwr-up failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG14, 0x1A), TAG, "reg14 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0x01), TAG, "reg0d digital pwr failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG15, 0x40), TAG, "reg15 dac failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG37, 0x08), TAG, "reg37 dac failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GP_REG45, 0x00), TAG, "reg45 dac failed");
@@ -920,8 +926,16 @@ esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
         ESP_LOGE(TAG, "es8311_start_dac failed: %s", esp_err_to_name(err));
         goto cleanup;
     }
+    /* On the Waveshare ESP32-S3-Touch-ePaper-1.54 V2 board the two "PA" pins
+     * have OPPOSITE active polarities, which is easy to get wrong:
+     *   - pa_enable_gpio (GPIO42, Audio_PWR_PIN) gates the entire audio
+     *     power rail and is ACTIVE LOW. Driving it HIGH cuts power to the
+     *     ES8311 and the speaker amplifier, so the codec produces no sound
+     *     even though I2S clocks and DAC registers look correct.
+     *   - pa_control_gpio (GPIO46, PA_CTRL) is the speaker amplifier enable
+     *     and is ACTIVE HIGH. */
     if (play_cfg.pa_enable_gpio >= 0) {
-        err = configure_output_pin(play_cfg.pa_enable_gpio, 1);
+        err = configure_output_pin(play_cfg.pa_enable_gpio, 0);
         if (err != ESP_OK) {
             ESP_LOGE(TAG, "pa_enable failed: %s", esp_err_to_name(err));
             goto cleanup;
@@ -997,6 +1011,9 @@ esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
 
 cleanup:
     if (pa_enabled) {
+        /* Disable the speaker amplifier (active HIGH) but keep the audio
+         * power rail asserted (active LOW) so a subsequent recording can
+         * reuse the already-initialized codec without re-powering it. */
         if (play_cfg.pa_control_gpio >= 0) {
             (void)gpio_set_level(play_cfg.pa_control_gpio, 0);
         }

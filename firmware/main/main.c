@@ -2422,7 +2422,6 @@ static esp_err_t build_volc_tts_request_body(const runtime_config_t *cfg,
         cJSON_AddStringToObject(app, "token", cfg->volc_tts_api_key) == NULL ||
         cJSON_AddStringToObject(app, "cluster", cfg->volc_tts_cluster) == NULL ||
         cJSON_AddStringToObject(user, "uid", cfg->device_id[0] ? cfg->device_id : "vibe-box") == NULL ||
-        cJSON_AddStringToObject(audio, "voice", "other") == NULL ||
         cJSON_AddStringToObject(audio, "voice_type", cfg->volc_tts_voice_type) == NULL ||
         cJSON_AddStringToObject(audio, "encoding", "wav") == NULL ||
         cJSON_AddNumberToObject(audio, "rate", VIBE_BOX_I2S_SAMPLE_RATE_HZ) == NULL ||
