@@ -341,6 +341,8 @@ static const char *TAG = "vibe_box";
 #endif
 
 #define TOUCH_CONFIG_BUTTON_TOP_Y        152U
+#define TOUCH_CONFIG_VOLUME_BUTTON_TOP_Y 116U
+#define TOUCH_CONFIG_VOLUME_BUTTON_BOTTOM_Y 146U
 #define TOUCH_CONFIG_BUTTON_FIRST_X      (UI_EPAPER_WIDTH / 3U)
 #define TOUCH_CONFIG_BUTTON_SECOND_X     ((UI_EPAPER_WIDTH * 2U) / 3U)
 
@@ -366,6 +368,8 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_BATTERY_FULL_MV          4120
 #define VIBE_BOX_BATTERY_DIVIDER_NUM      2
 #define VIBE_BOX_BATTERY_SAMPLE_COUNT     8
+#define VIBE_BOX_TTS_VOLUME_DEFAULT       100U
+#define VIBE_BOX_TTS_VOLUME_STEP          10U
 
 static EventGroupHandle_t s_wifi_event_group;
 static esp_netif_t *s_sta_netif;
@@ -413,6 +417,8 @@ typedef struct {
     bool translation_enabled;
     bool refine_enabled;
     bool tts_enabled;
+    uint8_t tts_volume_percent;
+    bool tts_muted;
     char device_id[RUNTIME_DEVICE_ID_MAX];
     char firmware_version[RUNTIME_FIRMWARE_VERSION_MAX];
     char language[RUNTIME_LANGUAGE_MAX];
@@ -566,6 +572,8 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
 #else
     cfg->tts_enabled = false;
 #endif
+    cfg->tts_volume_percent = VIBE_BOX_TTS_VOLUME_DEFAULT;
+    cfg->tts_muted = false;
     strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
     strlcpy(cfg->firmware_version,
             CONFIG_VIBE_BOX_FIRMWARE_VERSION,
@@ -601,6 +609,8 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  translation_enabled=%d", cfg->translation_enabled);
     ESP_LOGI(TAG, "  refine_enabled=%d", cfg->refine_enabled);
     ESP_LOGI(TAG, "  tts_enabled=%d", cfg->tts_enabled);
+    ESP_LOGI(TAG, "  tts_volume_percent=%u", (unsigned)cfg->tts_volume_percent);
+    ESP_LOGI(TAG, "  tts_muted=%d", cfg->tts_muted);
     ESP_LOGI(TAG, "  volc_tts_appid=%s", cfg->volc_tts_appid[0] ? cfg->volc_tts_appid : "<empty>");
     ESP_LOGI(TAG, "  volc_tts_api_key=%s", cfg->volc_tts_api_key[0] ? "<configured>" : "<empty>");
     ESP_LOGI(TAG,
@@ -728,6 +738,20 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
             cfg->tts_enabled = enabled != 0U;
         }
     }
+    {
+        uint8_t volume = 0;
+
+        if (nvs_get_u8(handle, "tts_vol", &volume) == ESP_OK && volume <= 100U) {
+            cfg->tts_volume_percent = volume;
+        }
+    }
+    {
+        uint8_t muted = 0;
+
+        if (nvs_get_u8(handle, "tts_mute", &muted) == ESP_OK) {
+            cfg->tts_muted = muted != 0U;
+        }
+    }
     nvs_load_string_or_default(handle, "device_id", cfg->device_id, sizeof(cfg->device_id));
     nvs_load_string_or_default(handle, "fw_ver", cfg->firmware_version, sizeof(cfg->firmware_version));
     nvs_load_string_or_default(handle, "language", cfg->language, sizeof(cfg->language));
@@ -852,6 +876,16 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
         ESP_LOGE(TAG, "save tts_en failed: %s", esp_err_to_name(err));
         goto exit;
     }
+    err = nvs_set_u8(handle, "tts_vol", cfg->tts_volume_percent);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_vol failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u8(handle, "tts_mute", cfg->tts_muted ? 1U : 0U);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_mute failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
     err = nvs_set_str(handle, "device_id", cfg->device_id);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "save device_id failed: %s", esp_err_to_name(err));
@@ -927,6 +961,33 @@ static bool json_copy_bool(cJSON *root, const char *key, bool *dst)
     return false;
 }
 
+static bool json_copy_u8_range(cJSON *root, const char *key, uint8_t *dst, uint8_t min, uint8_t max)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    long parsed = 0;
+
+    if (item == NULL) {
+        return true;
+    }
+    if (cJSON_IsNumber(item)) {
+        parsed = (long)item->valuedouble;
+    } else if (cJSON_IsString(item) && item->valuestring != NULL) {
+        char *end = NULL;
+        parsed = strtol(item->valuestring, &end, 10);
+        if (end == NULL || *end != '\0') {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    if (parsed < min || parsed > max) {
+        return false;
+    }
+
+    *dst = (uint8_t)parsed;
+    return true;
+}
+
 static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, size_t dst_len)
 {
     cJSON *root = NULL;
@@ -962,6 +1023,10 @@ static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, 
         cJSON_AddStringToObject(root, "volc_tts_voice_type", cfg->volc_tts_voice_type) == NULL ||
         cJSON_AddStringToObject(root, "volc_tts_cluster", cfg->volc_tts_cluster) == NULL ||
         cJSON_AddBoolToObject(root, "tts_enabled", cfg->tts_enabled) == NULL ||
+        cJSON_AddNumberToObject(root,
+                                "tts_volume_percent",
+                                (double)cfg->tts_volume_percent) == NULL ||
+        cJSON_AddBoolToObject(root, "tts_muted", cfg->tts_muted) == NULL ||
         cJSON_AddStringToObject(root, "device_id", cfg->device_id) == NULL ||
         cJSON_AddStringToObject(root, "firmware_version", cfg->firmware_version) == NULL ||
         cJSON_AddStringToObject(root, "language", cfg->language) == NULL ||
@@ -1033,6 +1098,9 @@ static void fill_runtime_config_defaults(runtime_config_t *cfg)
     }
     if (cfg->recording_duration_ms == 0U) {
         cfg->recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+    }
+    if (cfg->tts_volume_percent > 100U) {
+        cfg->tts_volume_percent = VIBE_BOX_TTS_VOLUME_DEFAULT;
     }
 }
 
@@ -1121,6 +1189,8 @@ static esp_err_t runtime_config_update_from_json(const char *json, runtime_confi
                           sizeof(next_config->volc_tts_cluster),
                           false) ||
         !json_copy_bool(root, "tts_enabled", &next_config->tts_enabled) ||
+        !json_copy_u8_range(root, "tts_volume_percent", &next_config->tts_volume_percent, 0U, 100U) ||
+        !json_copy_bool(root, "tts_muted", &next_config->tts_muted) ||
         !json_copy_string(root, "device_id", next_config->device_id, sizeof(next_config->device_id), false) ||
         !json_copy_string(root,
                           "firmware_version",
@@ -2491,6 +2561,8 @@ static audio_input_i2s_config_t make_audio_i2s_config(uint32_t duration_ms)
         .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
         .bits_per_sample = 16,
         .duration_ms = duration_ms,
+        .playback_volume_percent = s_runtime_config.tts_volume_percent,
+        .playback_muted = s_runtime_config.tts_muted,
     };
 }
 
@@ -2788,6 +2860,8 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "<label>Volc TTS Voice Type</label><input name='volc_tts_voice_type' value='%s' maxlength='95' />"
         "<label>Volc TTS Cluster</label><input name='volc_tts_cluster' value='%s' maxlength='63' />"
         "<label><input name='tts_enabled' type='checkbox' value='1' %s /> Enable TTS Playback</label>"
+        "<label>TTS Volume</label><input name='tts_volume_percent' type='number' min='0' max='100' value='%u' />"
+        "<label><input name='tts_muted' type='checkbox' value='1' %s /> Mute TTS Playback</label>"
         "<label>Device ID</label><input name='device_id' value='%s' maxlength='63' />"
         "<label>Firmware Version</label><input name='firmware_version' value='%s' maxlength='63' />"
         "<label>Language</label><input name='language' value='%s' maxlength='15' />"
@@ -2813,6 +2887,8 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         s_runtime_config.volc_tts_voice_type,
         s_runtime_config.volc_tts_cluster,
         s_runtime_config.tts_enabled ? "checked" : "",
+        (unsigned)s_runtime_config.tts_volume_percent,
+        s_runtime_config.tts_muted ? "checked" : "",
         s_runtime_config.device_id,
         s_runtime_config.firmware_version,
         s_runtime_config.language,
@@ -2834,7 +2910,8 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              "\"openai_api_base\":\"%s\",\"openai_api_key_configured\":%s,"
              "\"translation_model\":\"%s\",\"translation_target_language\":\"%s\","
              "\"translation_enabled\":%s,\"refine_enabled\":%s,"
-             "\"tts_enabled\":%s,\"volc_tts_appid\":\"%s\","
+             "\"tts_enabled\":%s,\"tts_volume_percent\":%u,\"tts_muted\":%s,"
+             "\"volc_tts_appid\":\"%s\","
              "\"volc_tts_api_key_configured\":%s,\"volc_tts_voice_type\":\"%s\","
              "\"volc_tts_cluster\":\"%s\","
              "\"device_id\":\"%s\",\"firmware_version\":\"%s\","
@@ -2851,6 +2928,8 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              s_runtime_config.translation_enabled ? "true" : "false",
              s_runtime_config.refine_enabled ? "true" : "false",
              s_runtime_config.tts_enabled ? "true" : "false",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted ? "true" : "false",
              s_runtime_config.volc_tts_appid,
              s_runtime_config.volc_tts_api_key[0] ? "true" : "false",
              s_runtime_config.volc_tts_voice_type,
@@ -2948,6 +3027,17 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
                        next_config.volc_tts_cluster,
                        sizeof(next_config.volc_tts_cluster));
     next_config.tts_enabled = strstr(body, "tts_enabled=1") != NULL;
+    {
+        char volume_buf[8];
+        if (extract_form_value(body, "tts_volume_percent", volume_buf, sizeof(volume_buf))) {
+            char *end = NULL;
+            unsigned long volume = strtoul(volume_buf, &end, 10);
+            if (end != NULL && *end == '\0' && volume <= 100UL) {
+                next_config.tts_volume_percent = (uint8_t)volume;
+            }
+        }
+    }
+    next_config.tts_muted = strstr(body, "tts_muted=1") != NULL;
     extract_form_value(body, "device_id", next_config.device_id, sizeof(next_config.device_id));
     extract_form_value(body,
                        "firmware_version",
@@ -3002,6 +3092,9 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
     }
     if (next_config.recording_duration_ms == 0U) {
         next_config.recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+    }
+    if (next_config.tts_volume_percent > 100U) {
+        next_config.tts_volume_percent = VIBE_BOX_TTS_VOLUME_DEFAULT;
     }
 
     ESP_RETURN_ON_ERROR(storage_save_runtime_config(&next_config), TAG, "failed to save config");
@@ -3123,6 +3216,8 @@ static void ui_dashboard_render_config_mode(void)
     char line[UI_EPAPER_MAX_COLS + 1];
     const int x = 4;
     const int line_step = 10;
+    const int volume_button_y = (int)TOUCH_CONFIG_VOLUME_BUTTON_TOP_Y;
+    const int volume_button_bottom = (int)TOUCH_CONFIG_VOLUME_BUTTON_BOTTOM_Y;
     const int button_y = (int)TOUCH_CONFIG_BUTTON_TOP_Y;
     const int button_bottom = UI_EPAPER_HEIGHT - 6;
     const int button_gap = 4;
@@ -3134,6 +3229,12 @@ static void ui_dashboard_render_config_mode(void)
     const int rf_x1 = second_x - button_gap;
     const int tts_x0 = second_x + button_gap;
     const int tts_x1 = UI_EPAPER_WIDTH - 5;
+    const int vol_down_x0 = 4;
+    const int vol_down_x1 = first_x - button_gap;
+    const int vol_mute_x0 = first_x + button_gap;
+    const int vol_mute_x1 = second_x - button_gap;
+    const int vol_up_x0 = second_x + button_gap;
+    const int vol_up_x1 = UI_EPAPER_WIDTH - 5;
 
     ui_epaper_clear();
     ui_epaper_draw_text(x, 4, "Config Mode");
@@ -3148,13 +3249,29 @@ static void ui_dashboard_render_config_mode(void)
     ui_epaper_draw_text(x, 24 + line_step, line);
     snprintf(line, sizeof(line), "TTS: %s", s_runtime_config.tts_enabled ? "ON" : "OFF");
     ui_epaper_draw_text(x, 24 + (line_step * 2), line);
+    snprintf(line,
+             sizeof(line),
+             "Vol: %u%% %s",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted ? "MUTED" : "ON");
+    ui_epaper_draw_text(x, 24 + (line_step * 3), line);
 
-    ui_epaper_draw_text(x, 64, "Swipe exits");
-    ui_epaper_draw_text(x, 74, "Tap a bottom button");
+    ui_epaper_draw_text(x, 70, "Swipe exits");
+    ui_epaper_draw_text(x, 80, "Tap a button");
+
+    ui_epaper_draw_rect(vol_down_x0, volume_button_y, vol_down_x1, volume_button_bottom);
+    ui_epaper_draw_rect(vol_mute_x0, volume_button_y, vol_mute_x1, volume_button_bottom);
+    ui_epaper_draw_rect(vol_up_x0, volume_button_y, vol_up_x1, volume_button_bottom);
 
     ui_epaper_draw_rect(tr_x0, button_y, tr_x1, button_bottom);
     ui_epaper_draw_rect(rf_x0, button_y, rf_x1, button_bottom);
     ui_epaper_draw_rect(tts_x0, button_y, tts_x1, button_bottom);
+
+    ui_epaper_draw_text(vol_down_x0 + 10, volume_button_y + 10, "VOL-");
+    ui_epaper_draw_text(vol_mute_x0 + 6,
+                        volume_button_y + 10,
+                        s_runtime_config.tts_muted ? "UNM" : "MUTE");
+    ui_epaper_draw_text(vol_up_x0 + 10, volume_button_y + 10, "VOL+");
 
     snprintf(line, sizeof(line), "TR %s", s_runtime_config.translation_enabled ? "ON" : "OFF");
     ui_epaper_draw_text(tr_x0 + 4, button_y + 14, line);
@@ -3302,6 +3419,14 @@ static void ui_dashboard_render_once(void)
     y += line_step;
 
     snprintf(line, sizeof(line), "TTS: %s", s_runtime_config.tts_enabled ? "on" : "off");
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    snprintf(line,
+             sizeof(line),
+             "Volume: %u%% %s",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted ? "muted" : "on");
     ui_epaper_draw_text(x, y, line);
     y += line_step;
 
@@ -3746,6 +3871,63 @@ static void toggle_tts_enabled(const char *reason)
     }
 }
 
+static void set_tts_volume(uint8_t volume_percent, const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    if (volume_percent > 100U) {
+        volume_percent = 100U;
+    }
+    next_config.tts_volume_percent = volume_percent;
+    if (volume_percent > 0U) {
+        next_config.tts_muted = false;
+    }
+
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS volume failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "TTS volume=%u%% muted=%d via %s",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted,
+             reason != NULL ? reason : "volume");
+    notify_ui_dashboard();
+}
+
+static void adjust_tts_volume(int delta_percent, const char *reason)
+{
+    int next = (int)s_runtime_config.tts_volume_percent + delta_percent;
+
+    if (next < 0) {
+        next = 0;
+    } else if (next > 100) {
+        next = 100;
+    }
+
+    set_tts_volume((uint8_t)next, reason);
+}
+
+static void toggle_tts_muted(const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    next_config.tts_muted = !s_runtime_config.tts_muted;
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS mute failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "TTS %s via %s",
+             s_runtime_config.tts_muted ? "muted" : "unmuted",
+             reason != NULL ? reason : "mute");
+    notify_ui_dashboard();
+}
+
 static void set_touch_config_mode(bool enabled, const char *reason)
 {
     if (s_touch_config_mode == enabled) {
@@ -3777,6 +3959,17 @@ static bool handle_touch_config_tap(uint32_t held_ms)
     }
 
     ESP_LOGI(TAG, "touch config tap x=%u y=%u", (unsigned)x, (unsigned)y);
+    if (y >= TOUCH_CONFIG_VOLUME_BUTTON_TOP_Y && y <= TOUCH_CONFIG_VOLUME_BUTTON_BOTTOM_Y) {
+        if (x < TOUCH_CONFIG_BUTTON_FIRST_X) {
+            adjust_tts_volume(-(int)VIBE_BOX_TTS_VOLUME_STEP, "config tap");
+        } else if (x < TOUCH_CONFIG_BUTTON_SECOND_X) {
+            toggle_tts_muted("config tap");
+        } else {
+            adjust_tts_volume((int)VIBE_BOX_TTS_VOLUME_STEP, "config tap");
+        }
+        return true;
+    }
+
     if (y < TOUCH_CONFIG_BUTTON_TOP_Y) {
         return false;
     }

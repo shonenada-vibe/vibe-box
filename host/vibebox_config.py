@@ -58,6 +58,8 @@ DEVICE_DEFAULTS: dict[str, str | int | bool] = {
     "volc_tts_voice_type": "",
     "volc_tts_cluster": "volcano_tts",
     "tts_enabled": False,
+    "tts_volume_percent": 100,
+    "tts_muted": False,
     "device_id": "vibe-box-dev",
     "firmware_version": "dev",
     "language": "zh",
@@ -219,6 +221,9 @@ def validate_device_config(cfg: dict[str, str | int | bool], *, require_complete
     recording_ms = int(cfg["recording_duration_ms"])
     if recording_ms < 1000 or recording_ms > 15000:
         raise ValueError("recording_duration_ms must be between 1000 and 15000")
+    tts_volume = int(cfg["tts_volume_percent"])
+    if tts_volume < 0 or tts_volume > 100:
+        raise ValueError("tts_volume_percent must be between 0 and 100")
 
     for key, limit in DEVICE_FIELD_LIMITS.items():
         value = str(cfg[key])

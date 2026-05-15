@@ -3,6 +3,7 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -41,6 +42,8 @@ static const char *TAG = "audio_input";
 #define ES8311_ADC_REG1A               0x1A
 #define ES8311_ADC_REG1B               0x1B
 #define ES8311_ADC_REG1C               0x1C
+#define ES8311_DAC_REG31               0x31
+#define ES8311_DAC_REG32               0x32
 #define ES8311_DAC_REG37               0x37
 #define ES8311_GPIO_REG44              0x44
 #define ES8311_GP_REG45                0x45
@@ -196,7 +199,16 @@ static esp_err_t es8311_start_adc(void)
     return ESP_OK;
 }
 
-static esp_err_t es8311_start_dac(void)
+static uint8_t es8311_dac_volume_reg(uint8_t volume_percent)
+{
+    if (volume_percent > 100U) {
+        volume_percent = 100U;
+    }
+
+    return (uint8_t)(((uint16_t)volume_percent * 0xBFU + 50U) / 100U);
+}
+
+static esp_err_t es8311_start_dac(uint8_t volume_percent, bool muted)
 {
     /* Keep the codec setup aligned with the ADC path, but unmute the DAC
      * serial input (REG09 bit 6) and power up the DAC analog/digital blocks. */
@@ -204,8 +216,19 @@ static esp_err_t es8311_start_dac(void)
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0x01), TAG, "reg0d digital pwr failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0E, 0x02), TAG, "reg0e analog pwr failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG12, 0x00), TAG, "reg12 pwr-up failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG14, 0x1A), TAG, "reg14 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG15, 0x40), TAG, "reg15 dac failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG37, 0x08), TAG, "reg37 dac failed");
     ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GP_REG45, 0x00), TAG, "reg45 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG32,
+                                         es8311_dac_volume_reg(volume_percent)),
+                        TAG,
+                        "dac volume failed");
+    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_DAC_REG31,
+                                          0x60,
+                                          muted ? 0x60 : 0x00),
+                        TAG,
+                        "dac mute failed");
     return ESP_OK;
 }
 
@@ -215,7 +238,7 @@ static void es8311_dump_registers(const char *label)
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
         0x09, 0x0A, 0x0D, 0x0E, 0x12, 0x13, 0x14, 0x15,
         0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
-        0x44, 0x45, 0xFD, 0xFE, 0xFF,
+        0x31, 0x32, 0x37, 0x44, 0x45, 0xFD, 0xFE, 0xFF,
     };
     for (size_t i = 0; i < sizeof(regs); ++i) {
         uint8_t v = 0xAA;
@@ -308,6 +331,26 @@ static i2s_std_slot_config_t build_i2s_tx_slot_config(uint16_t channels)
 
     slot_cfg.slot_mask = channels == 1U ? I2S_STD_SLOT_LEFT : I2S_STD_SLOT_BOTH;
     return slot_cfg;
+}
+
+static size_t duplicate_mono_pcm16_to_stereo(const uint8_t *src,
+                                             size_t src_bytes,
+                                             uint8_t *dst,
+                                             size_t dst_size)
+{
+    size_t samples = src_bytes / 2U;
+
+    if (dst_size / 4U < samples) {
+        samples = dst_size / 4U;
+    }
+
+    for (size_t i = 0; i < samples; ++i) {
+        uint16_t sample = read_le16(src + (i * 2U));
+        write_le16(dst + (i * 4U), sample);
+        write_le16(dst + (i * 4U) + 2U, sample);
+    }
+
+    return samples * 4U;
 }
 
 typedef struct {
@@ -790,6 +833,7 @@ esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
     wav_view_t view = {0};
     audio_input_i2s_config_t play_cfg;
     i2s_chan_handle_t tx_handle = NULL;
+    uint8_t *stereo_chunk = NULL;
     bool tx_enabled = false;
     bool pa_enabled = false;
     esp_err_t err;
@@ -824,7 +868,7 @@ esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
     }
 
     play_cfg = *cfg;
-    play_cfg.channels = view.channels;
+    play_cfg.channels = view.channels == 1U ? 2U : view.channels;
     play_cfg.bits_per_sample = view.bits_per_sample;
     play_cfg.duration_ms = 0;
 
@@ -871,7 +915,7 @@ esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
     tx_enabled = true;
 
     vTaskDelay(pdMS_TO_TICKS(20));
-    err = es8311_start_dac();
+    err = es8311_start_dac(play_cfg.playback_volume_percent, play_cfg.playback_muted);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "es8311_start_dac failed: %s", esp_err_to_name(err));
         goto cleanup;
@@ -892,30 +936,60 @@ esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
         }
         pa_enabled = true;
     }
+    if (pa_enabled) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 
     ESP_LOGI(TAG,
-             "playback started pcm_bytes=%u sample_rate=%" PRIu32 " channels=%u",
+             "playback started pcm_bytes=%u sample_rate=%" PRIu32
+             " wav_channels=%u i2s_channels=%u volume=%u%% muted=%d",
              (unsigned)view.pcm_size,
              view.sample_rate_hz,
-             (unsigned)view.channels);
+             (unsigned)view.channels,
+             (unsigned)play_cfg.channels,
+             (unsigned)play_cfg.playback_volume_percent,
+             play_cfg.playback_muted);
 
     size_t offset = 0;
+    if (view.channels == 1U) {
+        stereo_chunk = malloc(4096U);
+        if (stereo_chunk == NULL) {
+            err = ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "allocate stereo playback chunk failed");
+            goto cleanup;
+        }
+    }
     while (offset < view.pcm_size) {
         size_t to_write = view.pcm_size - offset;
         if (to_write > 4096U) {
             to_write = 4096U;
         }
+        if (view.channels == 1U && to_write > 2048U) {
+            to_write = 2048U;
+        }
+        to_write &= ~(size_t)1U;
+        if (to_write == 0U) {
+            break;
+        }
+
+        const uint8_t *write_buf = view.pcm + offset;
+        size_t write_len = to_write;
+        if (view.channels == 1U) {
+            write_len = duplicate_mono_pcm16_to_stereo(write_buf, to_write, stereo_chunk, 4096U);
+            write_buf = stereo_chunk;
+        }
+
         size_t written = 0;
         err = i2s_channel_write(tx_handle,
-                                view.pcm + offset,
-                                to_write,
+                                write_buf,
+                                write_len,
                                 &written,
                                 pdMS_TO_TICKS(1000));
         if ((err != ESP_OK && err != ESP_ERR_TIMEOUT) || written == 0U) {
             ESP_LOGE(TAG, "i2s tx write failed: %s", esp_err_to_name(err));
             goto cleanup;
         }
-        offset += written;
+        offset += view.channels == 1U ? (written / 2U) : written;
     }
 
     ESP_LOGI(TAG, "playback finished pcm_bytes=%u", (unsigned)view.pcm_size);
@@ -936,6 +1010,7 @@ cleanup:
         }
         (void)i2s_del_channel(tx_handle);
     }
+    free(stereo_chunk);
     portENTER_CRITICAL(&s_rec_lock);
     s_playback_active = false;
     portEXIT_CRITICAL(&s_rec_lock);

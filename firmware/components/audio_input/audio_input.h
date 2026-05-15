@@ -23,6 +23,8 @@ typedef struct {
     uint16_t channels;
     uint16_t bits_per_sample;
     uint32_t duration_ms;
+    uint8_t playback_volume_percent;
+    bool playback_muted;
 } audio_input_i2s_config_t;
 
 size_t audio_input_pcm_size(uint32_t sample_rate_hz,
