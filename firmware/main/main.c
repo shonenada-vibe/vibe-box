@@ -141,8 +141,30 @@ static const char *TAG = "vibe_box";
 #endif
 
 #define VIBE_BOX_VOLC_TTS_URL "https://openspeech.bytedance.com/api/v1/tts"
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_APPID
+#define VIBE_BOX_DEFAULT_VOLC_TTS_APPID CONFIG_VIBE_BOX_VOLC_TTS_APPID
+#else
+#define VIBE_BOX_DEFAULT_VOLC_TTS_APPID ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_API_KEY
+#define VIBE_BOX_DEFAULT_VOLC_TTS_API_KEY CONFIG_VIBE_BOX_VOLC_TTS_API_KEY
+#else
+#define VIBE_BOX_DEFAULT_VOLC_TTS_API_KEY ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_CLUSTER
+#define VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER CONFIG_VIBE_BOX_VOLC_TTS_CLUSTER
+#else
 #define VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER "volcano_tts"
+#endif
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_VOICE_TYPE
+#define VIBE_BOX_DEFAULT_VOLC_TTS_VOICE_TYPE CONFIG_VIBE_BOX_VOLC_TTS_VOICE_TYPE
+#else
 #define VIBE_BOX_DEFAULT_VOLC_TTS_VOICE_TYPE ""
+#endif
 
 #ifdef CONFIG_VIBE_BOX_LANGUAGE
 #define VIBE_BOX_DEFAULT_LANGUAGE CONFIG_VIBE_BOX_LANGUAGE
@@ -319,7 +341,8 @@ static const char *TAG = "vibe_box";
 #endif
 
 #define TOUCH_CONFIG_BUTTON_TOP_Y        152U
-#define TOUCH_CONFIG_BUTTON_SPLIT_X      (UI_EPAPER_WIDTH / 2U)
+#define TOUCH_CONFIG_BUTTON_FIRST_X      (UI_EPAPER_WIDTH / 3U)
+#define TOUCH_CONFIG_BUTTON_SECOND_X     ((UI_EPAPER_WIDTH * 2U) / 3U)
 
 #ifdef CONFIG_VIBE_BOX_RECORDING_MAX_MS
 #define VIBE_BOX_RECORDING_MAX_MS CONFIG_VIBE_BOX_RECORDING_MAX_MS
@@ -524,6 +547,12 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
     strlcpy(cfg->refine_prompt,
             VIBE_BOX_DEFAULT_REFINE_PROMPT,
             sizeof(cfg->refine_prompt));
+    strlcpy(cfg->volc_tts_appid,
+            VIBE_BOX_DEFAULT_VOLC_TTS_APPID,
+            sizeof(cfg->volc_tts_appid));
+    strlcpy(cfg->volc_tts_api_key,
+            VIBE_BOX_DEFAULT_VOLC_TTS_API_KEY,
+            sizeof(cfg->volc_tts_api_key));
     strlcpy(cfg->volc_tts_cluster,
             VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER,
             sizeof(cfg->volc_tts_cluster));
@@ -532,7 +561,11 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
             sizeof(cfg->volc_tts_voice_type));
     cfg->translation_enabled = false;
     cfg->refine_enabled = false;
+#ifdef CONFIG_VIBE_BOX_TTS_ENABLED
+    cfg->tts_enabled = true;
+#else
     cfg->tts_enabled = false;
+#endif
     strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
     strlcpy(cfg->firmware_version,
             CONFIG_VIBE_BOX_FIRMWARE_VERSION,
@@ -1623,6 +1656,7 @@ static esp_err_t perform_http_request_with_auth_header(const runtime_config_t *c
     }
     if (authorization_header != NULL && authorization_header[0] != '\0') {
         ESP_ERROR_CHECK(esp_http_client_set_header(client, "Authorization", authorization_header));
+        ESP_LOGI(TAG, "http Authorization header configured");
     }
     if (body != NULL && body_len > 0U) {
         ESP_ERROR_CHECK(esp_http_client_set_post_field(client, (const char *)body, (int)body_len));
@@ -1637,7 +1671,7 @@ static esp_err_t perform_http_request_with_auth_header(const runtime_config_t *c
 
     if (err == ESP_OK && response_buf != NULL && response_buf_size > 0U) {
         response_buf[response_ctx.length] = '\0';
-        if (log_response_body) {
+        if (log_response_body || status < 200 || status >= 300) {
             ESP_LOGI(TAG, "http response status=%d body=%s", status, response_buf);
         } else {
             ESP_LOGI(TAG, "http response status=%d body_len=%u", status, (unsigned)response_ctx.length);
@@ -2474,10 +2508,16 @@ static esp_err_t synthesize_tts_and_play(const runtime_config_t *cfg, const char
         return ESP_ERR_INVALID_ARG;
     }
     if (!cfg->tts_enabled) {
+        ESP_LOGI(TAG, "TTS skipped: disabled");
         return ESP_OK;
     }
     if (cfg->volc_tts_appid[0] == '\0' || cfg->volc_tts_api_key[0] == '\0' ||
         cfg->volc_tts_voice_type[0] == '\0') {
+        ESP_LOGW(TAG,
+                 "TTS skipped: incomplete config appid=%s api_key=%s voice_type=%s",
+                 cfg->volc_tts_appid[0] ? "set" : "empty",
+                 cfg->volc_tts_api_key[0] ? "set" : "empty",
+                 cfg->volc_tts_voice_type[0] ? "set" : "empty");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -2496,6 +2536,12 @@ static esp_err_t synthesize_tts_and_play(const runtime_config_t *cfg, const char
         err = ESP_ERR_INVALID_SIZE;
         goto cleanup;
     }
+    ESP_LOGI(TAG,
+             "TTS request auth configured api_key_len=%u appid=%s voice_type=%s cluster=%s",
+             (unsigned)strlen(cfg->volc_tts_api_key),
+             cfg->volc_tts_appid,
+             cfg->volc_tts_voice_type,
+             cfg->volc_tts_cluster);
 
     err = perform_http_request_with_auth_header(cfg,
                                                 VIBE_BOX_VOLC_TTS_URL,
@@ -3080,10 +3126,14 @@ static void ui_dashboard_render_config_mode(void)
     const int button_y = (int)TOUCH_CONFIG_BUTTON_TOP_Y;
     const int button_bottom = UI_EPAPER_HEIGHT - 6;
     const int button_gap = 4;
-    const int left_x0 = 4;
-    const int left_x1 = (UI_EPAPER_WIDTH / 2) - button_gap;
-    const int right_x0 = (UI_EPAPER_WIDTH / 2) + button_gap;
-    const int right_x1 = UI_EPAPER_WIDTH - 5;
+    const int first_x = (int)TOUCH_CONFIG_BUTTON_FIRST_X;
+    const int second_x = (int)TOUCH_CONFIG_BUTTON_SECOND_X;
+    const int tr_x0 = 4;
+    const int tr_x1 = first_x - button_gap;
+    const int rf_x0 = first_x + button_gap;
+    const int rf_x1 = second_x - button_gap;
+    const int tts_x0 = second_x + button_gap;
+    const int tts_x1 = UI_EPAPER_WIDTH - 5;
 
     ui_epaper_clear();
     ui_epaper_draw_text(x, 4, "Config Mode");
@@ -3096,17 +3146,22 @@ static void ui_dashboard_render_config_mode(void)
     ui_epaper_draw_text(x, 24, line);
     snprintf(line, sizeof(line), "Refine: %s", s_runtime_config.refine_enabled ? "ON" : "OFF");
     ui_epaper_draw_text(x, 24 + line_step, line);
+    snprintf(line, sizeof(line), "TTS: %s", s_runtime_config.tts_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(x, 24 + (line_step * 2), line);
 
-    ui_epaper_draw_text(x, 54, "Swipe exits");
-    ui_epaper_draw_text(x, 64, "Tap a bottom button");
+    ui_epaper_draw_text(x, 64, "Swipe exits");
+    ui_epaper_draw_text(x, 74, "Tap a bottom button");
 
-    ui_epaper_draw_rect(left_x0, button_y, left_x1, button_bottom);
-    ui_epaper_draw_rect(right_x0, button_y, right_x1, button_bottom);
+    ui_epaper_draw_rect(tr_x0, button_y, tr_x1, button_bottom);
+    ui_epaper_draw_rect(rf_x0, button_y, rf_x1, button_bottom);
+    ui_epaper_draw_rect(tts_x0, button_y, tts_x1, button_bottom);
 
     snprintf(line, sizeof(line), "TR %s", s_runtime_config.translation_enabled ? "ON" : "OFF");
-    ui_epaper_draw_text(left_x0 + 8, button_y + 14, line);
+    ui_epaper_draw_text(tr_x0 + 4, button_y + 14, line);
     snprintf(line, sizeof(line), "RF %s", s_runtime_config.refine_enabled ? "ON" : "OFF");
-    ui_epaper_draw_text(right_x0 + 8, button_y + 14, line);
+    ui_epaper_draw_text(rf_x0 + 4, button_y + 14, line);
+    snprintf(line, sizeof(line), "TT %s", s_runtime_config.tts_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(tts_x0 + 4, button_y + 14, line);
 }
 
 static void ui_dashboard_render_once(void)
@@ -3667,6 +3722,30 @@ static void toggle_refine_enabled(const char *reason)
     }
 }
 
+static void toggle_tts_enabled(const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    next_config.tts_enabled = !s_runtime_config.tts_enabled;
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS toggle failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "TTS %s via %s",
+             s_runtime_config.tts_enabled ? "enabled" : "disabled",
+             reason != NULL ? reason : "toggle");
+    if (s_touch_config_mode) {
+        notify_ui_dashboard();
+    } else {
+        render_ui_status(APP_STATE_IDLE,
+                         "TTS",
+                         s_runtime_config.tts_enabled ? "enabled" : "disabled");
+    }
+}
+
 static void set_touch_config_mode(bool enabled, const char *reason)
 {
     if (s_touch_config_mode == enabled) {
@@ -3702,10 +3781,12 @@ static bool handle_touch_config_tap(uint32_t held_ms)
         return false;
     }
 
-    if (x < TOUCH_CONFIG_BUTTON_SPLIT_X) {
+    if (x < TOUCH_CONFIG_BUTTON_FIRST_X) {
         toggle_translation_enabled("config tap");
-    } else {
+    } else if (x < TOUCH_CONFIG_BUTTON_SECOND_X) {
         toggle_refine_enabled("config tap");
+    } else {
+        toggle_tts_enabled("config tap");
     }
     return true;
 }
@@ -3788,6 +3869,14 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         s_touch_recording_started = false;
         if (s_touch_config_mode) {
             return;
+        }
+        if (s_touch_last_tap_release_ms != 0U &&
+            now_ms - s_touch_last_tap_release_ms <= (uint32_t)VIBE_BOX_TOUCH_DOUBLE_TAP_MS) {
+            ESP_LOGI(TAG, "touch down is double-tap candidate; hold recording deferred");
+            return;
+        }
+        if (s_touch_last_tap_release_ms != 0U) {
+            s_touch_last_tap_release_ms = 0;
         }
         BaseType_t ok = xTaskCreatePinnedToCore(
             touch_hold_recording_task,

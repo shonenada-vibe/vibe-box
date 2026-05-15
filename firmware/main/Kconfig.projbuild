@@ -96,6 +96,39 @@ config VIBE_BOX_REFINE_PROMPT
     help
         System prompt sent with each text refinement request.
 
+config VIBE_BOX_TTS_ENABLED
+    bool "Enable Volcengine TTS playback by default"
+    default n
+    help
+        Enable synthesized speech playback after transcription, translation, and
+        refinement complete. This is only the factory default; runtime BLE or
+        provisioning config can still override it.
+
+config VIBE_BOX_VOLC_TTS_APPID
+    string "Volcengine TTS App ID"
+    default ""
+    help
+        App ID sent in the Volcengine TTS app.appid field.
+
+config VIBE_BOX_VOLC_TTS_API_KEY
+    string "Volcengine TTS API key"
+    default ""
+    help
+        API token sent in the Volcengine TTS app.token field and in the
+        Authorization header as Bearer;token.
+
+config VIBE_BOX_VOLC_TTS_VOICE_TYPE
+    string "Volcengine TTS voice type"
+    default ""
+    help
+        Voice type sent in the Volcengine TTS audio.voice_type field.
+
+config VIBE_BOX_VOLC_TTS_CLUSTER
+    string "Volcengine TTS cluster"
+    default "volcano_tts"
+    help
+        Cluster sent in the Volcengine TTS app.cluster field.
+
 config VIBE_BOX_DEVICE_ID
     string "Device ID"
     default "vibe-box-dev"
