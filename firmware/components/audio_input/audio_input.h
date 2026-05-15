@@ -18,6 +18,7 @@ typedef struct {
     int bclk_gpio;
     int ws_gpio;
     int din_gpio;
+    int dout_gpio;
     uint32_t sample_rate_hz;
     uint16_t channels;
     uint16_t bits_per_sample;
@@ -53,3 +54,13 @@ bool audio_input_recording_is_active(void);
 esp_err_t audio_input_recording_stop(uint8_t **wav_out,
                                      size_t *wav_size_out,
                                      uint32_t *duration_ms_out);
+
+/*
+ * Playback API for 16-bit PCM WAV data through the same ES8311 codec.
+ * The call blocks until all PCM data has been written to I2S. It rejects
+ * playback while recording is active.
+ */
+esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
+                               const uint8_t *wav,
+                               size_t wav_size);
+bool audio_input_playback_is_active(void);

@@ -125,6 +125,11 @@ class DeviceConfig:
     translation_enabled: bool = False
     refine_prompt: str = DEFAULT_REFINE_PROMPT
     refine_enabled: bool = False
+    volc_tts_appid: str = ""
+    volc_tts_api_key: str = ""
+    volc_tts_voice_type: str = ""
+    volc_tts_cluster: str = "volcano_tts"
+    tts_enabled: bool = False
     device_id: str = "vibe-box-dev"
     firmware_version: str = "dev"
     language: str = "zh"
@@ -145,6 +150,11 @@ class DeviceConfig:
             "translation_enabled": self.translation_enabled,
             "refine_prompt": self.refine_prompt,
             "refine_enabled": self.refine_enabled,
+            "volc_tts_appid": self.volc_tts_appid,
+            "volc_tts_api_key": self.volc_tts_api_key,
+            "volc_tts_voice_type": self.volc_tts_voice_type,
+            "volc_tts_cluster": self.volc_tts_cluster,
+            "tts_enabled": self.tts_enabled,
             "device_id": self.device_id,
             "firmware_version": self.firmware_version,
             "language": self.language,
@@ -168,6 +178,11 @@ def device_config_from_json(payload: str) -> DeviceConfig:
         translation_enabled=bool(values.get("translation_enabled", False)),
         refine_prompt=values.get("refine_prompt", DEFAULT_REFINE_PROMPT),
         refine_enabled=bool(values.get("refine_enabled", False)),
+        volc_tts_appid=values.get("volc_tts_appid", ""),
+        volc_tts_api_key=values.get("volc_tts_api_key", ""),
+        volc_tts_voice_type=values.get("volc_tts_voice_type", ""),
+        volc_tts_cluster=values.get("volc_tts_cluster", "volcano_tts"),
+        tts_enabled=bool(values.get("tts_enabled", False)),
         device_id=values.get("device_id", "vibe-box-dev"),
         firmware_version=values.get("firmware_version", "dev"),
         language=values.get("language", "zh"),
@@ -278,6 +293,11 @@ DEVICE_FIELDS = [
     ("translation_enabled", "Translation enabled", False),
     ("refine_prompt", "Refine prompt", False),
     ("refine_enabled", "Refine enabled", False),
+    ("volc_tts_appid", "Volc TTS appid", False),
+    ("volc_tts_api_key", "Volc TTS API key", True),
+    ("volc_tts_voice_type", "Volc TTS voice", False),
+    ("volc_tts_cluster", "Volc TTS cluster", False),
+    ("tts_enabled", "TTS enabled", False),
     ("device_id", "Device ID", False),
     ("firmware_version", "Firmware version", False),
     ("language", "Language", False),

@@ -247,6 +247,13 @@ config VIBE_BOX_I2S_DIN_GPIO
     help
         Serial data input GPIO from the codec ADC into the ESP32.
 
+config VIBE_BOX_I2S_DOUT_GPIO
+    int "I2S DOUT GPIO"
+    range -1 48
+    default 45
+    help
+        Serial data output GPIO from the ESP32 into the codec DAC.
+
 config VIBE_BOX_I2S_SAMPLE_RATE_HZ
     int "I2S sample rate (Hz)"
     range 8000 48000
