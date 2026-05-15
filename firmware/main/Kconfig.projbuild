@@ -1,16 +1,44 @@
 menu "Vibe Box Config"
 
+menu "Wi-Fi Networks"
+
 config VIBE_BOX_WIFI_SSID
-    string "Wi-Fi SSID"
+    string "Wi-Fi 1 SSID"
     default ""
     help
-        Station mode SSID for the device.
+        Primary Wi-Fi network SSID. The device tries this network first.
 
 config VIBE_BOX_WIFI_PASSWORD
-    string "Wi-Fi password"
+    string "Wi-Fi 1 password"
     default ""
     help
-        Station mode password for the device.
+        Primary Wi-Fi network password.
+
+config VIBE_BOX_WIFI_2_SSID
+    string "Wi-Fi 2 SSID"
+    default ""
+    help
+        Secondary Wi-Fi network SSID. The device tries this if the primary fails.
+
+config VIBE_BOX_WIFI_2_PASSWORD
+    string "Wi-Fi 2 password"
+    default ""
+    help
+        Secondary Wi-Fi network password.
+
+config VIBE_BOX_WIFI_3_SSID
+    string "Wi-Fi 3 SSID"
+    default ""
+    help
+        Tertiary Wi-Fi network SSID. The device tries this if both primary and secondary fail.
+
+config VIBE_BOX_WIFI_3_PASSWORD
+    string "Wi-Fi 3 password"
+    default ""
+    help
+        Tertiary Wi-Fi network password.
+
+endmenu
 
 config VIBE_BOX_PROVISIONING_AP_SSID
     string "Provisioning AP SSID"

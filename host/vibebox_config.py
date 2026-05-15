@@ -39,9 +39,8 @@ DEFAULT_REFINE_PROMPT = (
     "Return only the refined text."
 )
 
-DEVICE_DEFAULTS: dict[str, str | int | bool] = {
-    "wifi_ssid": "",
-    "wifi_password": "",
+DEVICE_DEFAULTS: dict[str, str | int | bool | list] = {
+    "wifi_list": [],
     "whisper_api_url": "",
     "whisper_api_key": "",
     "stt_model": "whisper-large-v3-turbo",
@@ -67,8 +66,6 @@ DEVICE_DEFAULTS: dict[str, str | int | bool] = {
 }
 
 DEVICE_FIELD_LIMITS = {
-    "wifi_ssid": 32,
-    "wifi_password": 64,
     "whisper_api_url": 255,
     "whisper_api_key": 255,
     "stt_model": 95,
@@ -211,10 +208,11 @@ def normalize_device_config(values: dict[str, Any], *, require_complete: bool = 
     return normalized
 
 
-def validate_device_config(cfg: dict[str, str | int | bool], *, require_complete: bool = True) -> None:
+def validate_device_config(cfg: dict[str, str | int | bool | list], *, require_complete: bool = True) -> None:
     if require_complete:
-        if not str(cfg["wifi_ssid"]).strip():
-            raise ValueError("wifi_ssid is required")
+        wifi_list = cfg.get("wifi_list", [])
+        if not wifi_list or not any(isinstance(w, dict) and w.get("ssid", "").strip() for w in wifi_list):
+            raise ValueError("at least one wifi network is required")
         if not str(cfg["whisper_api_url"]).strip():
             raise ValueError("whisper_api_url is required")
 
@@ -350,13 +348,15 @@ async def cmd_write(args: argparse.Namespace) -> int:
 
 def cmd_template(args: argparse.Namespace) -> int:
     payload = {
-        "wifi_ssid": "Your Wi-Fi SSID",
-        "wifi_password": "Your Wi-Fi password",
+        "wifi_list": [
+            {"ssid": "Your Wi-Fi SSID", "password": "Your Wi-Fi password"},
+        ],
     }
     if args.full:
         payload = dict(DEVICE_DEFAULTS)
-        payload["wifi_ssid"] = "Your Wi-Fi SSID"
-        payload["wifi_password"] = "Your Wi-Fi password"
+        payload["wifi_list"] = [
+            {"ssid": "Your Wi-Fi SSID", "password": "Your Wi-Fi password"},
+        ]
         payload["whisper_api_url"] = "https://api.openai.com/v1/audio/transcriptions"
     print_json(payload, compact=args.compact)
     return 0

@@ -111,9 +111,14 @@ class HostConfig:
 
 
 @dataclass
+class WifiEntry:
+    ssid: str = ""
+    password: str = ""
+
+
+@dataclass
 class DeviceConfig:
-    wifi_ssid: str = ""
-    wifi_password: str = ""
+    wifi_list: list[WifiEntry] = None
     whisper_api_url: str = ""
     whisper_api_key: str = ""
     stt_model: str = "whisper-large-v3-turbo"
@@ -137,10 +142,13 @@ class DeviceConfig:
     language: str = "zh"
     recording_duration_ms: int = 3000
 
-    def as_ble_payload(self) -> dict[str, str | int | bool]:
+    def __post_init__(self):
+        if self.wifi_list is None:
+            self.wifi_list = []
+
+    def as_ble_payload(self) -> dict[str, str | int | bool | list]:
         return {
-            "wifi_ssid": self.wifi_ssid,
-            "wifi_password": self.wifi_password,
+            "wifi_list": [{"ssid": w.ssid, "password": w.password} for w in self.wifi_list],
             "whisper_api_url": self.whisper_api_url,
             "whisper_api_key": self.whisper_api_key,
             "stt_model": self.stt_model,
@@ -168,9 +176,13 @@ class DeviceConfig:
 
 def device_config_from_json(payload: str) -> DeviceConfig:
     values = json.loads(payload)
+    wifi_list = []
+    if "wifi_list" in values and isinstance(values["wifi_list"], list):
+        for w in values["wifi_list"]:
+            if isinstance(w, dict):
+                wifi_list.append(WifiEntry(ssid=w.get("ssid", ""), password=w.get("password", "")))
     return DeviceConfig(
-        wifi_ssid=values.get("wifi_ssid", ""),
-        wifi_password=values.get("wifi_password", ""),
+        wifi_list=wifi_list,
         whisper_api_url=values.get("whisper_api_url", ""),
         whisper_api_key=values.get("whisper_api_key", ""),
         stt_model=values.get("stt_model", "whisper-large-v3-turbo"),
@@ -197,8 +209,8 @@ def device_config_from_json(payload: str) -> DeviceConfig:
 
 
 def validate_device_config(cfg: DeviceConfig) -> None:
-    if not cfg.wifi_ssid.strip() or not cfg.whisper_api_url.strip():
-        raise ValueError("wifi_ssid and whisper_api_url are required")
+    if not cfg.wifi_list or not any(w.ssid.strip() for w in cfg.wifi_list) or not cfg.whisper_api_url.strip():
+        raise ValueError("at least one wifi network and whisper_api_url are required")
     if cfg.recording_duration_ms < 1000 or cfg.recording_duration_ms > 15000:
         raise ValueError("recording_duration_ms must be between 1000 and 15000")
     if cfg.tts_volume_percent < 0 or cfg.tts_volume_percent > 100:
@@ -288,8 +300,12 @@ HOST_FIELDS = [
 ]
 
 DEVICE_FIELDS = [
-    ("wifi_ssid", "Wi-Fi SSID", False),
-    ("wifi_password", "Wi-Fi password", True),
+    ("wifi_list[0].ssid", "Wi-Fi 1 SSID", False),
+    ("wifi_list[0].password", "Wi-Fi 1 password", True),
+    ("wifi_list[1].ssid", "Wi-Fi 2 SSID", False),
+    ("wifi_list[1].password", "Wi-Fi 2 password", True),
+    ("wifi_list[2].ssid", "Wi-Fi 3 SSID", False),
+    ("wifi_list[2].password", "Wi-Fi 3 password", True),
     ("whisper_api_url", "Whisper API URL", False),
     ("whisper_api_key", "Whisper API key", True),
     ("stt_model", "STT model", False),
@@ -315,9 +331,36 @@ DEVICE_FIELDS = [
 ]
 
 
+def get_nested_attr(obj: Any, key: str) -> Any:
+    import re
+    match = re.match(r"(\w+)\[(\d+)\]\.(\w+)", key)
+    if match:
+        list_name, idx_str, attr_name = match.groups()
+        lst = getattr(obj, list_name, [])
+        idx = int(idx_str)
+        while len(lst) <= idx:
+            lst.append(WifiEntry())
+        return getattr(lst[idx], attr_name, "")
+    return getattr(obj, key)
+
+
+def set_nested_attr(obj: Any, key: str, value: Any) -> None:
+    import re
+    match = re.match(r"(\w+)\[(\d+)\]\.(\w+)", key)
+    if match:
+        list_name, idx_str, attr_name = match.groups()
+        lst = getattr(obj, list_name, [])
+        idx = int(idx_str)
+        while len(lst) <= idx:
+            lst.append(WifiEntry())
+        setattr(lst[idx], attr_name, value)
+        return
+    setattr(obj, key, value)
+
+
 def display_value(value: Any, secret: bool = False) -> str:
     if isinstance(value, list):
-        value = ", ".join(value)
+        value = ", ".join(str(v) for v in value)
     if isinstance(value, bool):
         return "on" if value else "off"
     text = str(value)
@@ -361,7 +404,7 @@ def draw_panel(
     safe_addstr(stdscr, y, x, fit(title, width), attr)
     y += 1
     for idx, (key, label, secret) in enumerate(fields):
-        value = display_value(getattr(obj, key), secret=secret)
+        value = display_value(get_nested_attr(obj, key), secret=secret)
         line = f"{label}: {value}"
         row_attr = curses.A_REVERSE if active and idx == selected else curses.A_NORMAL
         safe_addstr(stdscr, y + idx, x, fit(line.ljust(width), width), row_attr)
@@ -482,10 +525,10 @@ def edit_host_field(stdscr, state: TuiState) -> None:
 
 def edit_device_field(stdscr, state: TuiState) -> None:
     key, label, secret = DEVICE_FIELDS[state.selected[1]]
-    current = getattr(state.device_config, key)
+    current = get_nested_attr(state.device_config, key)
     if isinstance(current, bool):
-        setattr(state.device_config, key, not current)
-        state.log(f"{label} staged: {display_value(getattr(state.device_config, key))}")
+        set_nested_attr(state.device_config, key, not current)
+        state.log(f"{label} staged: {display_value(get_nested_attr(state.device_config, key))}")
         return
 
     next_value = prompt(stdscr, label, str(current), secret=secret)
@@ -497,14 +540,14 @@ def edit_device_field(stdscr, state: TuiState) -> None:
             parsed = int(next_value)
             if parsed < 1000 or parsed > 15000:
                 raise ValueError("must be between 1000 and 15000")
-            setattr(state.device_config, key, parsed)
+            set_nested_attr(state.device_config, key, parsed)
         elif key == "tts_volume_percent":
             parsed = int(next_value)
             if parsed < 0 or parsed > 100:
                 raise ValueError("must be between 0 and 100")
-            setattr(state.device_config, key, parsed)
+            set_nested_attr(state.device_config, key, parsed)
         else:
-            setattr(state.device_config, key, next_value.strip())
+            set_nested_attr(state.device_config, key, next_value.strip())
         state.log(f"{label} staged")
     except ValueError as exc:
         state.log(f"Invalid {label}: {exc}")

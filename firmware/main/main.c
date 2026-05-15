@@ -56,6 +56,7 @@ static const char *TAG = "vibe_box";
 #define UI_DASHBOARD_REFRESH_MS         10000U
 #define RUNTIME_WIFI_SSID_MAX           33
 #define RUNTIME_WIFI_PASSWORD_MAX       65
+#define RUNTIME_WIFI_LIST_MAX           3
 #define RUNTIME_SERVER_BASE_URL_MAX     192
 #define RUNTIME_API_TOKEN_MAX           192
 #define RUNTIME_WHISPER_API_URL_MAX     256
@@ -79,6 +80,30 @@ static const char *TAG = "vibe_box";
 #define PROVISIONING_STATUS_BUFFER_SIZE 2048
 #define WIFI_CONNECT_TIMEOUT_MS         30000
 #define NVS_NAMESPACE                   "vibe_box"
+
+#ifdef CONFIG_VIBE_BOX_WIFI_2_SSID
+#define VIBE_BOX_WIFI_2_SSID CONFIG_VIBE_BOX_WIFI_2_SSID
+#else
+#define VIBE_BOX_WIFI_2_SSID ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_WIFI_2_PASSWORD
+#define VIBE_BOX_WIFI_2_PASSWORD CONFIG_VIBE_BOX_WIFI_2_PASSWORD
+#else
+#define VIBE_BOX_WIFI_2_PASSWORD ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_WIFI_3_SSID
+#define VIBE_BOX_WIFI_3_SSID CONFIG_VIBE_BOX_WIFI_3_SSID
+#else
+#define VIBE_BOX_WIFI_3_SSID ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_WIFI_3_PASSWORD
+#define VIBE_BOX_WIFI_3_PASSWORD CONFIG_VIBE_BOX_WIFI_3_PASSWORD
+#else
+#define VIBE_BOX_WIFI_3_PASSWORD ""
+#endif
 
 #ifdef CONFIG_VIBE_BOX_API_TOKEN
 #define VIBE_BOX_DEFAULT_API_TOKEN CONFIG_VIBE_BOX_API_TOKEN
@@ -376,6 +401,7 @@ static esp_netif_t *s_sta_netif;
 static esp_netif_t *s_ap_netif;
 static httpd_handle_t s_provisioning_server;
 static int s_retry_num;
+static uint8_t s_wifi_current_index;
 static bool s_network_stack_ready;
 static bool s_wifi_driver_ready;
 static bool s_wifi_station_started;
@@ -397,8 +423,13 @@ typedef enum {
 } app_state_t;
 
 typedef struct {
-    char wifi_ssid[RUNTIME_WIFI_SSID_MAX];
-    char wifi_password[RUNTIME_WIFI_PASSWORD_MAX];
+    char ssid[RUNTIME_WIFI_SSID_MAX];
+    char password[RUNTIME_WIFI_PASSWORD_MAX];
+} wifi_entry_t;
+
+typedef struct {
+    wifi_entry_t wifi_list[RUNTIME_WIFI_LIST_MAX];
+    uint8_t wifi_count;
     char server_base_url[RUNTIME_SERVER_BASE_URL_MAX];
     char api_token[RUNTIME_API_TOKEN_MAX];
     char whisper_api_url[RUNTIME_WHISPER_API_URL_MAX];
@@ -522,8 +553,22 @@ static void set_state(app_state_t *state, app_state_t next_state, const char *re
 static void runtime_config_load_defaults(runtime_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
-    strlcpy(cfg->wifi_ssid, CONFIG_VIBE_BOX_WIFI_SSID, sizeof(cfg->wifi_ssid));
-    strlcpy(cfg->wifi_password, CONFIG_VIBE_BOX_WIFI_PASSWORD, sizeof(cfg->wifi_password));
+    cfg->wifi_count = 0;
+    if (CONFIG_VIBE_BOX_WIFI_SSID[0] != '\0') {
+        strlcpy(cfg->wifi_list[cfg->wifi_count].ssid, CONFIG_VIBE_BOX_WIFI_SSID, sizeof(cfg->wifi_list[0].ssid));
+        strlcpy(cfg->wifi_list[cfg->wifi_count].password, CONFIG_VIBE_BOX_WIFI_PASSWORD, sizeof(cfg->wifi_list[0].password));
+        cfg->wifi_count++;
+    }
+    if (VIBE_BOX_WIFI_2_SSID[0] != '\0') {
+        strlcpy(cfg->wifi_list[cfg->wifi_count].ssid, VIBE_BOX_WIFI_2_SSID, sizeof(cfg->wifi_list[0].ssid));
+        strlcpy(cfg->wifi_list[cfg->wifi_count].password, VIBE_BOX_WIFI_2_PASSWORD, sizeof(cfg->wifi_list[0].password));
+        cfg->wifi_count++;
+    }
+    if (VIBE_BOX_WIFI_3_SSID[0] != '\0') {
+        strlcpy(cfg->wifi_list[cfg->wifi_count].ssid, VIBE_BOX_WIFI_3_SSID, sizeof(cfg->wifi_list[0].ssid));
+        strlcpy(cfg->wifi_list[cfg->wifi_count].password, VIBE_BOX_WIFI_3_PASSWORD, sizeof(cfg->wifi_list[0].password));
+        cfg->wifi_count++;
+    }
     strlcpy(cfg->server_base_url,
             CONFIG_VIBE_BOX_SERVER_BASE_URL,
             sizeof(cfg->server_base_url));
@@ -584,7 +629,7 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
 
 static bool runtime_config_is_complete(const runtime_config_t *cfg)
 {
-    return cfg->wifi_ssid[0] != '\0' && cfg->whisper_api_url[0] != '\0';
+    return cfg->wifi_count > 0 && cfg->wifi_list[0].ssid[0] != '\0' && cfg->whisper_api_url[0] != '\0';
 }
 
 static void log_runtime_config(const runtime_config_t *cfg, const char *source)
@@ -593,8 +638,11 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  config_source=%s", source);
     ESP_LOGI(TAG, "  project=vibe_box");
     ESP_LOGI(TAG, "  free_heap=%" PRIu32, esp_get_free_heap_size());
-    ESP_LOGI(TAG, "  wifi_ssid=%s", cfg->wifi_ssid[0] ? cfg->wifi_ssid : "<empty>");
-    ESP_LOGI(TAG, "  wifi_password=%s", cfg->wifi_password[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG, "  wifi_count=%u", (unsigned)cfg->wifi_count);
+    for (uint8_t i = 0; i < cfg->wifi_count && i < RUNTIME_WIFI_LIST_MAX; i++) {
+        ESP_LOGI(TAG, "  wifi_list[%u].ssid=%s", (unsigned)i, cfg->wifi_list[i].ssid[0] ? cfg->wifi_list[i].ssid : "<empty>");
+        ESP_LOGI(TAG, "  wifi_list[%u].password=%s", (unsigned)i, cfg->wifi_list[i].password[0] ? "<configured>" : "<empty>");
+    }
     ESP_LOGI(TAG, "  server_base_url=%s", cfg->server_base_url[0] ? cfg->server_base_url : "<empty>");
     ESP_LOGI(TAG, "  api_token=%s", cfg->api_token[0] ? "<configured>" : "<empty>");
     ESP_LOGI(TAG, "  whisper_api_url=%s", cfg->whisper_api_url[0] ? cfg->whisper_api_url : "<empty>");
@@ -685,8 +733,30 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
         return err;
     }
 
-    nvs_load_string_or_default(handle, "wifi_ssid", cfg->wifi_ssid, sizeof(cfg->wifi_ssid));
-    nvs_load_string_or_default(handle, "wifi_pass", cfg->wifi_password, sizeof(cfg->wifi_password));
+    {
+        uint8_t count = 0;
+        if (nvs_get_u8(handle, "wifi_cnt", &count) == ESP_OK && count <= RUNTIME_WIFI_LIST_MAX) {
+            cfg->wifi_count = count;
+        }
+        for (uint8_t i = 0; i < cfg->wifi_count && i < RUNTIME_WIFI_LIST_MAX; i++) {
+            char key_ssid[16], key_pass[16];
+            snprintf(key_ssid, sizeof(key_ssid), "wifi_%u_ssid", (unsigned)i);
+            snprintf(key_pass, sizeof(key_pass), "wifi_%u_pass", (unsigned)i);
+            nvs_load_string_or_default(handle, key_ssid, cfg->wifi_list[i].ssid, sizeof(cfg->wifi_list[i].ssid));
+            nvs_load_string_or_default(handle, key_pass, cfg->wifi_list[i].password, sizeof(cfg->wifi_list[i].password));
+        }
+        if (cfg->wifi_count == 0) {
+            char legacy_ssid[RUNTIME_WIFI_SSID_MAX] = {0};
+            char legacy_pass[RUNTIME_WIFI_PASSWORD_MAX] = {0};
+            nvs_load_string_or_default(handle, "wifi_ssid", legacy_ssid, sizeof(legacy_ssid));
+            nvs_load_string_or_default(handle, "wifi_pass", legacy_pass, sizeof(legacy_pass));
+            if (legacy_ssid[0] != '\0') {
+                strlcpy(cfg->wifi_list[0].ssid, legacy_ssid, sizeof(cfg->wifi_list[0].ssid));
+                strlcpy(cfg->wifi_list[0].password, legacy_pass, sizeof(cfg->wifi_list[0].password));
+                cfg->wifi_count = 1;
+            }
+        }
+    }
     nvs_load_string_or_default(handle, "server_url", cfg->server_base_url, sizeof(cfg->server_base_url));
     nvs_load_string_or_default(handle, "api_token", cfg->api_token, sizeof(cfg->api_token));
     nvs_load_string_or_default(handle, "whisper_url", cfg->whisper_api_url, sizeof(cfg->whisper_api_url));
@@ -776,15 +846,25 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
         return err;
     }
 
-    err = nvs_set_str(handle, "wifi_ssid", cfg->wifi_ssid);
+    err = nvs_set_u8(handle, "wifi_cnt", cfg->wifi_count);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "save wifi_ssid failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "save wifi_cnt failed: %s", esp_err_to_name(err));
         goto exit;
     }
-    err = nvs_set_str(handle, "wifi_pass", cfg->wifi_password);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "save wifi_pass failed: %s", esp_err_to_name(err));
-        goto exit;
+    for (uint8_t i = 0; i < cfg->wifi_count && i < RUNTIME_WIFI_LIST_MAX; i++) {
+        char key_ssid[16], key_pass[16];
+        snprintf(key_ssid, sizeof(key_ssid), "wifi_%u_ssid", (unsigned)i);
+        snprintf(key_pass, sizeof(key_pass), "wifi_%u_pass", (unsigned)i);
+        err = nvs_set_str(handle, key_ssid, cfg->wifi_list[i].ssid);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "save %s failed: %s", key_ssid, esp_err_to_name(err));
+            goto exit;
+        }
+        err = nvs_set_str(handle, key_pass, cfg->wifi_list[i].password);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "save %s failed: %s", key_pass, esp_err_to_name(err));
+            goto exit;
+        }
     }
     err = nvs_set_str(handle, "server_url", cfg->server_base_url);
     if (err != ESP_OK) {
@@ -1003,9 +1083,26 @@ static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, 
         return ESP_ERR_NO_MEM;
     }
 
-    if (cJSON_AddStringToObject(root, "wifi_ssid", cfg->wifi_ssid) == NULL ||
-        cJSON_AddStringToObject(root, "wifi_password", cfg->wifi_password) == NULL ||
-        cJSON_AddStringToObject(root, "whisper_api_url", cfg->whisper_api_url) == NULL ||
+    {
+        cJSON *wifi_array = cJSON_AddArrayToObject(root, "wifi_list");
+        if (wifi_array == NULL) {
+            err = ESP_ERR_NO_MEM;
+            goto cleanup;
+        }
+        for (uint8_t i = 0; i < cfg->wifi_count && i < RUNTIME_WIFI_LIST_MAX; i++) {
+            cJSON *wifi_obj = cJSON_CreateObject();
+            if (wifi_obj == NULL ||
+                cJSON_AddStringToObject(wifi_obj, "ssid", cfg->wifi_list[i].ssid) == NULL ||
+                cJSON_AddStringToObject(wifi_obj, "password", cfg->wifi_list[i].password) == NULL) {
+                cJSON_Delete(wifi_obj);
+                err = ESP_ERR_NO_MEM;
+                goto cleanup;
+            }
+            cJSON_AddItemToArray(wifi_array, wifi_obj);
+        }
+    }
+
+    if (cJSON_AddStringToObject(root, "whisper_api_url", cfg->whisper_api_url) == NULL ||
         cJSON_AddStringToObject(root, "whisper_api_key", cfg->whisper_api_key) == NULL ||
         cJSON_AddStringToObject(root, "stt_model", cfg->stt_model) == NULL ||
         cJSON_AddStringToObject(root, "openai_api_base", cfg->openai_api_base) == NULL ||
@@ -1119,13 +1216,43 @@ static esp_err_t runtime_config_update_from_json(const char *json, runtime_confi
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (!json_copy_string(root, "wifi_ssid", next_config->wifi_ssid, sizeof(next_config->wifi_ssid), true) ||
-        !json_copy_string(root,
-                          "wifi_password",
-                          next_config->wifi_password,
-                          sizeof(next_config->wifi_password),
-                          false) ||
-        !json_copy_string(root,
+    {
+        cJSON *wifi_array = cJSON_GetObjectItem(root, "wifi_list");
+        if (wifi_array != NULL && cJSON_IsArray(wifi_array)) {
+            int count = cJSON_GetArraySize(wifi_array);
+            if (count > RUNTIME_WIFI_LIST_MAX) {
+                count = RUNTIME_WIFI_LIST_MAX;
+            }
+            next_config->wifi_count = 0;
+            for (int i = 0; i < count; i++) {
+                cJSON *wifi_obj = cJSON_GetArrayItem(wifi_array, i);
+                if (wifi_obj == NULL || !cJSON_IsObject(wifi_obj)) {
+                    continue;
+                }
+                cJSON *ssid_item = cJSON_GetObjectItem(wifi_obj, "ssid");
+                cJSON *pass_item = cJSON_GetObjectItem(wifi_obj, "password");
+                if (ssid_item != NULL && cJSON_IsString(ssid_item) && ssid_item->valuestring != NULL) {
+                    strlcpy(next_config->wifi_list[next_config->wifi_count].ssid,
+                            ssid_item->valuestring,
+                            sizeof(next_config->wifi_list[next_config->wifi_count].ssid));
+                    if (pass_item != NULL && cJSON_IsString(pass_item) && pass_item->valuestring != NULL) {
+                        strlcpy(next_config->wifi_list[next_config->wifi_count].password,
+                                pass_item->valuestring,
+                                sizeof(next_config->wifi_list[next_config->wifi_count].password));
+                    } else {
+                        next_config->wifi_list[next_config->wifi_count].password[0] = '\0';
+                    }
+                    next_config->wifi_count++;
+                }
+            }
+        }
+        if (next_config->wifi_count == 0) {
+            err = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+    }
+
+    if (!json_copy_string(root,
                           "whisper_api_url",
                           next_config->whisper_api_url,
                           sizeof(next_config->whisper_api_url),
@@ -1451,11 +1578,11 @@ static esp_err_t wifi_stop_if_running(void)
     return ESP_OK;
 }
 
-static esp_err_t wifi_start_station(const runtime_config_t *cfg)
+static esp_err_t wifi_start_station_with_entry(const wifi_entry_t *entry, uint8_t index)
 {
     wifi_config_t wifi_config = {0};
 
-    if (cfg->wifi_ssid[0] == '\0') {
+    if (entry->ssid[0] == '\0') {
         ESP_LOGW(TAG, "Wi-Fi SSID not configured; staying in provisioning state");
         return ESP_ERR_INVALID_STATE;
     }
@@ -1465,17 +1592,18 @@ static esp_err_t wifi_start_station(const runtime_config_t *cfg)
 
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
     s_retry_num = 0;
+    s_wifi_current_index = index;
 
-    strlcpy((char *)wifi_config.sta.ssid, cfg->wifi_ssid, sizeof(wifi_config.sta.ssid));
-    strlcpy((char *)wifi_config.sta.password, cfg->wifi_password, sizeof(wifi_config.sta.password));
+    strlcpy((char *)wifi_config.sta.ssid, entry->ssid, sizeof(wifi_config.sta.ssid));
+    strlcpy((char *)wifi_config.sta.password, entry->password, sizeof(wifi_config.sta.password));
     wifi_config.sta.threshold.authmode =
-        cfg->wifi_password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+        entry->password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
 
     ESP_LOGI(TAG, "setting wifi mode to STA");
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "set mode sta failed");
-    ESP_LOGI(TAG, "applying station config ssid=%s", cfg->wifi_ssid);
+    ESP_LOGI(TAG, "applying station config ssid=%s (index=%u)", entry->ssid, (unsigned)index);
     ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "set sta config failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_MIN_MODEM), TAG, "enable wifi power save failed");
     ESP_LOGI(TAG, "starting wifi station");
@@ -1484,6 +1612,8 @@ static esp_err_t wifi_start_station(const runtime_config_t *cfg)
     s_wifi_station_started = true;
     return ESP_OK;
 }
+
+
 
 static bool wait_for_wifi_connection(TickType_t timeout_ticks)
 {
@@ -2841,8 +2971,14 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "<p>Connect the device to your Wi-Fi and Whisper-compatible STT endpoint, then submit the form. "
         "After saving, the device will leave <code>%s</code> and try to connect.</p>"
         "<form method='post' action='/configure'>"
-        "<label>Wi-Fi SSID</label><input name='wifi_ssid' value='%s' maxlength='32' />"
-        "<label>Wi-Fi Password</label><input name='wifi_password' type='password' value='%s' maxlength='64' />"
+        "<fieldset><legend>Wi-Fi Networks (up to 3)</legend>"
+        "<label>Wi-Fi 1 SSID</label><input name='wifi_0_ssid' value='%s' maxlength='32' />"
+        "<label>Wi-Fi 1 Password</label><input name='wifi_0_pass' type='password' value='%s' maxlength='64' />"
+        "<label>Wi-Fi 2 SSID</label><input name='wifi_1_ssid' value='%s' maxlength='32' />"
+        "<label>Wi-Fi 2 Password</label><input name='wifi_1_pass' type='password' value='%s' maxlength='64' />"
+        "<label>Wi-Fi 3 SSID</label><input name='wifi_2_ssid' value='%s' maxlength='32' />"
+        "<label>Wi-Fi 3 Password</label><input name='wifi_2_pass' type='password' value='%s' maxlength='64' />"
+        "</fieldset>"
         "<label>Whisper API URL</label><input name='whisper_api_url' value='%s' maxlength='255' />"
         "<label>Whisper API Key</label><input name='whisper_api_key' type='password' value='%s' maxlength='255' />"
         "<label>STT Model</label><input name='stt_model' value='%s' maxlength='95' />"
@@ -2868,8 +3004,12 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "<button type='submit'>Save And Reconnect</button></form>"
         "<p>Provisioning AP SSID: <strong>%s</strong></p></body></html>",
         app_state_name(APP_STATE_PROVISIONING),
-        s_runtime_config.wifi_ssid,
-        s_runtime_config.wifi_password,
+        s_runtime_config.wifi_count > 0 ? s_runtime_config.wifi_list[0].ssid : "",
+        s_runtime_config.wifi_count > 0 ? s_runtime_config.wifi_list[0].password : "",
+        s_runtime_config.wifi_count > 1 ? s_runtime_config.wifi_list[1].ssid : "",
+        s_runtime_config.wifi_count > 1 ? s_runtime_config.wifi_list[1].password : "",
+        s_runtime_config.wifi_count > 2 ? s_runtime_config.wifi_list[2].ssid : "",
+        s_runtime_config.wifi_count > 2 ? s_runtime_config.wifi_list[2].password : "",
         s_runtime_config.whisper_api_url,
         s_runtime_config.whisper_api_key,
         s_runtime_config.stt_model,
@@ -2904,7 +3044,7 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
 
     snprintf(payload,
              sizeof(payload),
-             "{\"state\":\"%s\",\"wifi_ssid\":\"%s\",\"whisper_api_url\":\"%s\","
+             "{\"state\":\"%s\",\"wifi_count\":%u,\"wifi_0_ssid\":\"%s\",\"whisper_api_url\":\"%s\","
              "\"whisper_api_key_configured\":%s,\"stt_model\":\"%s\","
              "\"openai_api_base\":\"%s\",\"openai_api_key_configured\":%s,"
              "\"translation_model\":\"%s\",\"translation_target_language\":\"%s\","
@@ -2916,7 +3056,8 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              "\"device_id\":\"%s\",\"firmware_version\":\"%s\","
              "\"language\":\"%s\",\"recording_duration_ms\":%" PRIu32 "}",
              app_state_name(APP_STATE_PROVISIONING),
-             s_runtime_config.wifi_ssid,
+             (unsigned)s_runtime_config.wifi_count,
+             s_runtime_config.wifi_count > 0 ? s_runtime_config.wifi_list[0].ssid : "",
              s_runtime_config.whisper_api_url,
              s_runtime_config.whisper_api_key[0] ? "true" : "false",
              s_runtime_config.stt_model,
@@ -2969,11 +3110,23 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
     body[received] = '\0';
 
     ESP_LOGI(TAG, "provisioning form body=%s", body);
-    extract_form_value(body, "wifi_ssid", next_config.wifi_ssid, sizeof(next_config.wifi_ssid));
-    extract_form_value(body,
-                       "wifi_password",
-                       next_config.wifi_password,
-                       sizeof(next_config.wifi_password));
+    {
+        next_config.wifi_count = 0;
+        for (uint8_t i = 0; i < RUNTIME_WIFI_LIST_MAX; i++) {
+            char key_ssid[16], key_pass[16];
+            snprintf(key_ssid, sizeof(key_ssid), "wifi_%u_ssid", (unsigned)i);
+            snprintf(key_pass, sizeof(key_pass), "wifi_%u_pass", (unsigned)i);
+            char ssid_buf[RUNTIME_WIFI_SSID_MAX] = {0};
+            char pass_buf[RUNTIME_WIFI_PASSWORD_MAX] = {0};
+            extract_form_value(body, key_ssid, ssid_buf, sizeof(ssid_buf));
+            extract_form_value(body, key_pass, pass_buf, sizeof(pass_buf));
+            if (ssid_buf[0] != '\0') {
+                strlcpy(next_config.wifi_list[next_config.wifi_count].ssid, ssid_buf, sizeof(next_config.wifi_list[0].ssid));
+                strlcpy(next_config.wifi_list[next_config.wifi_count].password, pass_buf, sizeof(next_config.wifi_list[0].password));
+                next_config.wifi_count++;
+            }
+        }
+    }
     extract_form_value(body,
                        "whisper_api_url",
                        next_config.whisper_api_url,
@@ -3048,7 +3201,7 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
     if (!runtime_config_is_complete(&next_config)) {
         httpd_resp_send_err(req,
                             HTTPD_400_BAD_REQUEST,
-                            "wifi_ssid and whisper_api_url are required");
+                            "at least one wifi network and whisper_api_url are required");
         return ESP_FAIL;
     }
 
@@ -3189,18 +3342,37 @@ static esp_err_t connect_using_runtime_config(app_state_t *state, const char *re
 
     stop_provisioning_server();
 
-    err = wifi_start_station(&s_runtime_config);
-    if (err != ESP_OK) {
-        return err;
+    if (s_runtime_config.wifi_count == 0) {
+        ESP_LOGW(TAG, "No Wi-Fi networks configured");
+        return ESP_ERR_INVALID_STATE;
     }
 
-    if (!wait_for_wifi_connection(pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS))) {
-        return ESP_FAIL;
+    for (uint8_t i = 0; i < s_runtime_config.wifi_count && i < RUNTIME_WIFI_LIST_MAX; i++) {
+        const wifi_entry_t *entry = &s_runtime_config.wifi_list[i];
+        if (entry->ssid[0] == '\0') {
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Trying Wi-Fi network %u/%u: %s", (unsigned)(i + 1), (unsigned)s_runtime_config.wifi_count, entry->ssid);
+
+        err = wifi_start_station_with_entry(entry, i);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to start station for network %u: %s", (unsigned)i, esp_err_to_name(err));
+            continue;
+        }
+
+        if (wait_for_wifi_connection(pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS))) {
+            ESP_LOGI(TAG, "Connected to Wi-Fi network %u: %s", (unsigned)i, entry->ssid);
+            set_state(state, APP_STATE_IDLE, reason);
+            render_ui_status(*state, "Idle", "wifi connected");
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG, "Failed to connect to network %u: %s", (unsigned)i, entry->ssid);
     }
 
-    set_state(state, APP_STATE_IDLE, reason);
-    render_ui_status(*state, "Idle", "wifi connected");
-    return ESP_OK;
+    ESP_LOGE(TAG, "Failed to connect to any configured Wi-Fi network");
+    return ESP_FAIL;
 }
 
 static esp_err_t prepare_audio_capture_pipeline(const runtime_config_t *cfg)
@@ -3341,7 +3513,8 @@ static void ui_dashboard_render_once(void)
 
     if (connected) {
         wifi_ap_record_t ap = {0};
-        const char *ssid = s_runtime_config.wifi_ssid;
+        const char *ssid = (s_runtime_config.wifi_count > 0 && s_wifi_current_index < s_runtime_config.wifi_count)
+                           ? s_runtime_config.wifi_list[s_wifi_current_index].ssid : "";
         int rssi = 0;
         bool have_rssi = false;
         if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
@@ -3370,7 +3543,8 @@ static void ui_dashboard_render_once(void)
             y += line_step;
         }
     } else {
-        snprintf(line, sizeof(line), "AP:%.20s", s_runtime_config.wifi_ssid);
+        const char *first_ssid = (s_runtime_config.wifi_count > 0) ? s_runtime_config.wifi_list[0].ssid : "";
+        snprintf(line, sizeof(line), "AP:%.20s", first_ssid);
         ui_epaper_draw_text(x, y, line);
         y += line_step;
     }
