@@ -25,12 +25,14 @@
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "mbedtls/base64.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -40,6 +42,7 @@ static const char *TAG = "vibe_box";
 #define WIFI_FAIL_BIT      BIT1
 
 #define QUERY_RESPONSE_BUFFER_SIZE      16384
+#define TTS_RESPONSE_BUFFER_SIZE        (512U * 1024U)
 #define FORM_BODY_BUFFER_SIZE           1024
 #define URL_BUFFER_SIZE                 320
 #define QUERY_DISPLAY_LINE_MAX          4
@@ -64,11 +67,15 @@ static const char *TAG = "vibe_box";
 #define RUNTIME_TRANSLATION_LANGUAGE_MAX 32
 #define RUNTIME_TRANSLATION_PROMPT_MAX  512
 #define RUNTIME_REFINE_PROMPT_MAX       512
+#define RUNTIME_VOLC_TTS_APPID_MAX      96
+#define RUNTIME_VOLC_TTS_API_KEY_MAX    256
+#define RUNTIME_VOLC_TTS_VOICE_TYPE_MAX 96
+#define RUNTIME_VOLC_TTS_CLUSTER_MAX    64
 #define RUNTIME_DEVICE_ID_MAX           64
 #define RUNTIME_FIRMWARE_VERSION_MAX    64
 #define RUNTIME_LANGUAGE_MAX            16
-#define PROVISIONING_FORM_BUFFER_SIZE   4096
-#define PROVISIONING_HTML_BUFFER_SIZE   8192
+#define PROVISIONING_FORM_BUFFER_SIZE   8192
+#define PROVISIONING_HTML_BUFFER_SIZE   12288
 #define PROVISIONING_STATUS_BUFFER_SIZE 2048
 #define WIFI_CONNECT_TIMEOUT_MS         30000
 #define NVS_NAMESPACE                   "vibe_box"
@@ -131,6 +138,32 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_DEFAULT_REFINE_PROMPT CONFIG_VIBE_BOX_REFINE_PROMPT
 #else
 #define VIBE_BOX_DEFAULT_REFINE_PROMPT "You are a text refinement engine. Rewrite the text to be fluent and natural while preserving the user's final intent. Remove filler words, repeated phrases, false starts, and self-corrections. If the speaker corrects themselves, keep only the corrected final meaning. Return only the refined text."
+#endif
+
+#define VIBE_BOX_VOLC_TTS_URL "https://openspeech.bytedance.com/api/v1/tts"
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_APPID
+#define VIBE_BOX_DEFAULT_VOLC_TTS_APPID CONFIG_VIBE_BOX_VOLC_TTS_APPID
+#else
+#define VIBE_BOX_DEFAULT_VOLC_TTS_APPID ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_API_KEY
+#define VIBE_BOX_DEFAULT_VOLC_TTS_API_KEY CONFIG_VIBE_BOX_VOLC_TTS_API_KEY
+#else
+#define VIBE_BOX_DEFAULT_VOLC_TTS_API_KEY ""
+#endif
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_CLUSTER
+#define VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER CONFIG_VIBE_BOX_VOLC_TTS_CLUSTER
+#else
+#define VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER "volcano_tts"
+#endif
+
+#ifdef CONFIG_VIBE_BOX_VOLC_TTS_VOICE_TYPE
+#define VIBE_BOX_DEFAULT_VOLC_TTS_VOICE_TYPE CONFIG_VIBE_BOX_VOLC_TTS_VOICE_TYPE
+#else
+#define VIBE_BOX_DEFAULT_VOLC_TTS_VOICE_TYPE ""
 #endif
 
 #ifdef CONFIG_VIBE_BOX_LANGUAGE
@@ -241,6 +274,12 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_I2S_DIN_GPIO -1
 #endif
 
+#ifdef CONFIG_VIBE_BOX_I2S_DOUT_GPIO
+#define VIBE_BOX_I2S_DOUT_GPIO CONFIG_VIBE_BOX_I2S_DOUT_GPIO
+#else
+#define VIBE_BOX_I2S_DOUT_GPIO -1
+#endif
+
 #ifdef CONFIG_VIBE_BOX_I2S_SAMPLE_RATE_HZ
 #define VIBE_BOX_I2S_SAMPLE_RATE_HZ CONFIG_VIBE_BOX_I2S_SAMPLE_RATE_HZ
 #else
@@ -302,7 +341,10 @@ static const char *TAG = "vibe_box";
 #endif
 
 #define TOUCH_CONFIG_BUTTON_TOP_Y        152U
-#define TOUCH_CONFIG_BUTTON_SPLIT_X      (UI_EPAPER_WIDTH / 2U)
+#define TOUCH_CONFIG_VOLUME_BUTTON_TOP_Y 116U
+#define TOUCH_CONFIG_VOLUME_BUTTON_BOTTOM_Y 146U
+#define TOUCH_CONFIG_BUTTON_FIRST_X      (UI_EPAPER_WIDTH / 3U)
+#define TOUCH_CONFIG_BUTTON_SECOND_X     ((UI_EPAPER_WIDTH * 2U) / 3U)
 
 #ifdef CONFIG_VIBE_BOX_RECORDING_MAX_MS
 #define VIBE_BOX_RECORDING_MAX_MS CONFIG_VIBE_BOX_RECORDING_MAX_MS
@@ -326,6 +368,8 @@ static const char *TAG = "vibe_box";
 #define VIBE_BOX_BATTERY_FULL_MV          4120
 #define VIBE_BOX_BATTERY_DIVIDER_NUM      2
 #define VIBE_BOX_BATTERY_SAMPLE_COUNT     8
+#define VIBE_BOX_TTS_VOLUME_DEFAULT       100U
+#define VIBE_BOX_TTS_VOLUME_STEP          10U
 
 static EventGroupHandle_t s_wifi_event_group;
 static esp_netif_t *s_sta_netif;
@@ -346,6 +390,8 @@ typedef enum {
     APP_STATE_TRANSCRIPTING,
     APP_STATE_TRANSLATING,
     APP_STATE_REFINING,
+    APP_STATE_TTS,
+    APP_STATE_PLAYING,
     APP_STATE_DISPLAYING,
     APP_STATE_ERROR,
 } app_state_t;
@@ -364,8 +410,15 @@ typedef struct {
     char translation_target_language[RUNTIME_TRANSLATION_LANGUAGE_MAX];
     char translation_prompt[RUNTIME_TRANSLATION_PROMPT_MAX];
     char refine_prompt[RUNTIME_REFINE_PROMPT_MAX];
+    char volc_tts_appid[RUNTIME_VOLC_TTS_APPID_MAX];
+    char volc_tts_api_key[RUNTIME_VOLC_TTS_API_KEY_MAX];
+    char volc_tts_voice_type[RUNTIME_VOLC_TTS_VOICE_TYPE_MAX];
+    char volc_tts_cluster[RUNTIME_VOLC_TTS_CLUSTER_MAX];
     bool translation_enabled;
     bool refine_enabled;
+    bool tts_enabled;
+    uint8_t tts_volume_percent;
+    bool tts_muted;
     char device_id[RUNTIME_DEVICE_ID_MAX];
     char firmware_version[RUNTIME_FIRMWARE_VERSION_MAX];
     char language[RUNTIME_LANGUAGE_MAX];
@@ -438,6 +491,10 @@ static const char *app_state_name(app_state_t state)
         return "translating";
     case APP_STATE_REFINING:
         return "refining";
+    case APP_STATE_TTS:
+        return "tts";
+    case APP_STATE_PLAYING:
+        return "playing";
     case APP_STATE_DISPLAYING:
         return "displaying";
     case APP_STATE_ERROR:
@@ -496,8 +553,27 @@ static void runtime_config_load_defaults(runtime_config_t *cfg)
     strlcpy(cfg->refine_prompt,
             VIBE_BOX_DEFAULT_REFINE_PROMPT,
             sizeof(cfg->refine_prompt));
+    strlcpy(cfg->volc_tts_appid,
+            VIBE_BOX_DEFAULT_VOLC_TTS_APPID,
+            sizeof(cfg->volc_tts_appid));
+    strlcpy(cfg->volc_tts_api_key,
+            VIBE_BOX_DEFAULT_VOLC_TTS_API_KEY,
+            sizeof(cfg->volc_tts_api_key));
+    strlcpy(cfg->volc_tts_cluster,
+            VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER,
+            sizeof(cfg->volc_tts_cluster));
+    strlcpy(cfg->volc_tts_voice_type,
+            VIBE_BOX_DEFAULT_VOLC_TTS_VOICE_TYPE,
+            sizeof(cfg->volc_tts_voice_type));
     cfg->translation_enabled = false;
     cfg->refine_enabled = false;
+#ifdef CONFIG_VIBE_BOX_TTS_ENABLED
+    cfg->tts_enabled = true;
+#else
+    cfg->tts_enabled = false;
+#endif
+    cfg->tts_volume_percent = VIBE_BOX_TTS_VOLUME_DEFAULT;
+    cfg->tts_muted = false;
     strlcpy(cfg->device_id, CONFIG_VIBE_BOX_DEVICE_ID, sizeof(cfg->device_id));
     strlcpy(cfg->firmware_version,
             CONFIG_VIBE_BOX_FIRMWARE_VERSION,
@@ -532,6 +608,15 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
              cfg->translation_target_language[0] ? cfg->translation_target_language : "<empty>");
     ESP_LOGI(TAG, "  translation_enabled=%d", cfg->translation_enabled);
     ESP_LOGI(TAG, "  refine_enabled=%d", cfg->refine_enabled);
+    ESP_LOGI(TAG, "  tts_enabled=%d", cfg->tts_enabled);
+    ESP_LOGI(TAG, "  tts_volume_percent=%u", (unsigned)cfg->tts_volume_percent);
+    ESP_LOGI(TAG, "  tts_muted=%d", cfg->tts_muted);
+    ESP_LOGI(TAG, "  volc_tts_appid=%s", cfg->volc_tts_appid[0] ? cfg->volc_tts_appid : "<empty>");
+    ESP_LOGI(TAG, "  volc_tts_api_key=%s", cfg->volc_tts_api_key[0] ? "<configured>" : "<empty>");
+    ESP_LOGI(TAG,
+             "  volc_tts_voice_type=%s",
+             cfg->volc_tts_voice_type[0] ? cfg->volc_tts_voice_type : "<empty>");
+    ESP_LOGI(TAG, "  volc_tts_cluster=%s", cfg->volc_tts_cluster[0] ? cfg->volc_tts_cluster : "<empty>");
     ESP_LOGI(TAG, "  device_id=%s", cfg->device_id[0] ? cfg->device_id : "<empty>");
     ESP_LOGI(TAG,
              "  firmware_version=%s",
@@ -550,6 +635,7 @@ static void log_runtime_config(const runtime_config_t *cfg, const char *source)
     ESP_LOGI(TAG, "  i2s_bclk_gpio=%d", VIBE_BOX_I2S_BCLK_GPIO);
     ESP_LOGI(TAG, "  i2s_ws_gpio=%d", VIBE_BOX_I2S_WS_GPIO);
     ESP_LOGI(TAG, "  i2s_din_gpio=%d", VIBE_BOX_I2S_DIN_GPIO);
+    ESP_LOGI(TAG, "  i2s_dout_gpio=%d", VIBE_BOX_I2S_DOUT_GPIO);
     ESP_LOGI(TAG, "  i2s_sample_rate_hz=%d", VIBE_BOX_I2S_SAMPLE_RATE_HZ);
     ESP_LOGI(TAG, "  i2s_channels=%d", VIBE_BOX_I2S_CHANNELS);
     ESP_LOGI(TAG, "  wifi_maximum_retry=%d", CONFIG_VIBE_BOX_WIFI_MAXIMUM_RETRY);
@@ -621,6 +707,16 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
                                "rf_prompt",
                                cfg->refine_prompt,
                                sizeof(cfg->refine_prompt));
+    nvs_load_string_or_default(handle, "tts_appid", cfg->volc_tts_appid, sizeof(cfg->volc_tts_appid));
+    nvs_load_string_or_default(handle, "tts_key", cfg->volc_tts_api_key, sizeof(cfg->volc_tts_api_key));
+    nvs_load_string_or_default(handle,
+                               "tts_voice",
+                               cfg->volc_tts_voice_type,
+                               sizeof(cfg->volc_tts_voice_type));
+    nvs_load_string_or_default(handle,
+                               "tts_cluster",
+                               cfg->volc_tts_cluster,
+                               sizeof(cfg->volc_tts_cluster));
     {
         uint8_t enabled = 0;
 
@@ -633,6 +729,27 @@ static esp_err_t storage_load_runtime_config(runtime_config_t *cfg, bool *loaded
 
         if (nvs_get_u8(handle, "rf_en", &enabled) == ESP_OK) {
             cfg->refine_enabled = enabled != 0U;
+        }
+    }
+    {
+        uint8_t enabled = 0;
+
+        if (nvs_get_u8(handle, "tts_en", &enabled) == ESP_OK) {
+            cfg->tts_enabled = enabled != 0U;
+        }
+    }
+    {
+        uint8_t volume = 0;
+
+        if (nvs_get_u8(handle, "tts_vol", &volume) == ESP_OK && volume <= 100U) {
+            cfg->tts_volume_percent = volume;
+        }
+    }
+    {
+        uint8_t muted = 0;
+
+        if (nvs_get_u8(handle, "tts_mute", &muted) == ESP_OK) {
+            cfg->tts_muted = muted != 0U;
         }
     }
     nvs_load_string_or_default(handle, "device_id", cfg->device_id, sizeof(cfg->device_id));
@@ -734,6 +851,41 @@ static esp_err_t storage_save_runtime_config(const runtime_config_t *cfg)
         ESP_LOGE(TAG, "save rf_en failed: %s", esp_err_to_name(err));
         goto exit;
     }
+    err = nvs_set_str(handle, "tts_appid", cfg->volc_tts_appid);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_appid failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "tts_key", cfg->volc_tts_api_key);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_key failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "tts_voice", cfg->volc_tts_voice_type);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_voice failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_str(handle, "tts_cluster", cfg->volc_tts_cluster);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_cluster failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u8(handle, "tts_en", cfg->tts_enabled ? 1U : 0U);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_en failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u8(handle, "tts_vol", cfg->tts_volume_percent);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_vol failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
+    err = nvs_set_u8(handle, "tts_mute", cfg->tts_muted ? 1U : 0U);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save tts_mute failed: %s", esp_err_to_name(err));
+        goto exit;
+    }
     err = nvs_set_str(handle, "device_id", cfg->device_id);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "save device_id failed: %s", esp_err_to_name(err));
@@ -809,6 +961,33 @@ static bool json_copy_bool(cJSON *root, const char *key, bool *dst)
     return false;
 }
 
+static bool json_copy_u8_range(cJSON *root, const char *key, uint8_t *dst, uint8_t min, uint8_t max)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    long parsed = 0;
+
+    if (item == NULL) {
+        return true;
+    }
+    if (cJSON_IsNumber(item)) {
+        parsed = (long)item->valuedouble;
+    } else if (cJSON_IsString(item) && item->valuestring != NULL) {
+        char *end = NULL;
+        parsed = strtol(item->valuestring, &end, 10);
+        if (end == NULL || *end != '\0') {
+            return false;
+        }
+    } else {
+        return false;
+    }
+    if (parsed < min || parsed > max) {
+        return false;
+    }
+
+    *dst = (uint8_t)parsed;
+    return true;
+}
+
 static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, size_t dst_len)
 {
     cJSON *root = NULL;
@@ -839,6 +1018,15 @@ static esp_err_t runtime_config_to_json(const runtime_config_t *cfg, char *dst, 
         cJSON_AddBoolToObject(root, "translation_enabled", cfg->translation_enabled) == NULL ||
         cJSON_AddStringToObject(root, "refine_prompt", cfg->refine_prompt) == NULL ||
         cJSON_AddBoolToObject(root, "refine_enabled", cfg->refine_enabled) == NULL ||
+        cJSON_AddStringToObject(root, "volc_tts_appid", cfg->volc_tts_appid) == NULL ||
+        cJSON_AddStringToObject(root, "volc_tts_api_key", cfg->volc_tts_api_key) == NULL ||
+        cJSON_AddStringToObject(root, "volc_tts_voice_type", cfg->volc_tts_voice_type) == NULL ||
+        cJSON_AddStringToObject(root, "volc_tts_cluster", cfg->volc_tts_cluster) == NULL ||
+        cJSON_AddBoolToObject(root, "tts_enabled", cfg->tts_enabled) == NULL ||
+        cJSON_AddNumberToObject(root,
+                                "tts_volume_percent",
+                                (double)cfg->tts_volume_percent) == NULL ||
+        cJSON_AddBoolToObject(root, "tts_muted", cfg->tts_muted) == NULL ||
         cJSON_AddStringToObject(root, "device_id", cfg->device_id) == NULL ||
         cJSON_AddStringToObject(root, "firmware_version", cfg->firmware_version) == NULL ||
         cJSON_AddStringToObject(root, "language", cfg->language) == NULL ||
@@ -903,8 +1091,16 @@ static void fill_runtime_config_defaults(runtime_config_t *cfg)
                 VIBE_BOX_DEFAULT_REFINE_PROMPT,
                 sizeof(cfg->refine_prompt));
     }
+    if (cfg->volc_tts_cluster[0] == '\0') {
+        strlcpy(cfg->volc_tts_cluster,
+                VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER,
+                sizeof(cfg->volc_tts_cluster));
+    }
     if (cfg->recording_duration_ms == 0U) {
         cfg->recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+    }
+    if (cfg->tts_volume_percent > 100U) {
+        cfg->tts_volume_percent = VIBE_BOX_TTS_VOLUME_DEFAULT;
     }
 }
 
@@ -972,6 +1168,29 @@ static esp_err_t runtime_config_update_from_json(const char *json, runtime_confi
                           sizeof(next_config->refine_prompt),
                           false) ||
         !json_copy_bool(root, "refine_enabled", &next_config->refine_enabled) ||
+        !json_copy_string(root,
+                          "volc_tts_appid",
+                          next_config->volc_tts_appid,
+                          sizeof(next_config->volc_tts_appid),
+                          false) ||
+        !json_copy_string(root,
+                          "volc_tts_api_key",
+                          next_config->volc_tts_api_key,
+                          sizeof(next_config->volc_tts_api_key),
+                          false) ||
+        !json_copy_string(root,
+                          "volc_tts_voice_type",
+                          next_config->volc_tts_voice_type,
+                          sizeof(next_config->volc_tts_voice_type),
+                          false) ||
+        !json_copy_string(root,
+                          "volc_tts_cluster",
+                          next_config->volc_tts_cluster,
+                          sizeof(next_config->volc_tts_cluster),
+                          false) ||
+        !json_copy_bool(root, "tts_enabled", &next_config->tts_enabled) ||
+        !json_copy_u8_range(root, "tts_volume_percent", &next_config->tts_volume_percent, 0U, 100U) ||
+        !json_copy_bool(root, "tts_muted", &next_config->tts_muted) ||
         !json_copy_string(root, "device_id", next_config->device_id, sizeof(next_config->device_id), false) ||
         !json_copy_string(root,
                           "firmware_version",
@@ -1449,16 +1668,17 @@ static bool extract_form_u32(const char *body, const char *key, uint32_t *value_
     return true;
 }
 
-static esp_err_t perform_http_request(const runtime_config_t *cfg,
-                                      const char *path,
-                                      esp_http_client_method_t method,
-                                      const char *content_type,
-                                      const char *bearer_token,
-                                      const uint8_t *body,
-                                      size_t body_len,
-                                      char *response_buf,
-                                      size_t response_buf_size,
-                                      int *status_out)
+static esp_err_t perform_http_request_with_auth_header(const runtime_config_t *cfg,
+                                                       const char *path,
+                                                       esp_http_client_method_t method,
+                                                       const char *content_type,
+                                                       const char *authorization_header,
+                                                       const uint8_t *body,
+                                                       size_t body_len,
+                                                       char *response_buf,
+                                                       size_t response_buf_size,
+                                                       int *status_out,
+                                                       bool log_response_body)
 {
     char url[URL_BUFFER_SIZE];
     http_response_context_t response_ctx = {
@@ -1504,13 +1724,9 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
     if (content_type != NULL) {
         ESP_ERROR_CHECK(esp_http_client_set_header(client, "Content-Type", content_type));
     }
-    if (bearer_token != NULL && bearer_token[0] != '\0') {
-        char bearer_header[RUNTIME_WHISPER_API_KEY_MAX + 16U];
-
-        if (snprintf(bearer_header, sizeof(bearer_header), "Bearer %s", bearer_token) <
-            (int)sizeof(bearer_header)) {
-            ESP_ERROR_CHECK(esp_http_client_set_header(client, "Authorization", bearer_header));
-        }
+    if (authorization_header != NULL && authorization_header[0] != '\0') {
+        ESP_ERROR_CHECK(esp_http_client_set_header(client, "Authorization", authorization_header));
+        ESP_LOGI(TAG, "http Authorization header configured");
     }
     if (body != NULL && body_len > 0U) {
         ESP_ERROR_CHECK(esp_http_client_set_post_field(client, (const char *)body, (int)body_len));
@@ -1525,7 +1741,11 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
 
     if (err == ESP_OK && response_buf != NULL && response_buf_size > 0U) {
         response_buf[response_ctx.length] = '\0';
-        ESP_LOGI(TAG, "http response status=%d body=%s", status, response_buf);
+        if (log_response_body || status < 200 || status >= 300) {
+            ESP_LOGI(TAG, "http response status=%d body=%s", status, response_buf);
+        } else {
+            ESP_LOGI(TAG, "http response status=%d body_len=%u", status, (unsigned)response_ctx.length);
+        }
         if (response_ctx.truncated) {
             ESP_LOGW(TAG, "http response body truncated capacity=%u", (unsigned)response_buf_size);
         }
@@ -1544,6 +1764,41 @@ static esp_err_t perform_http_request(const runtime_config_t *cfg,
     }
 
     return ESP_OK;
+}
+
+static esp_err_t perform_http_request(const runtime_config_t *cfg,
+                                      const char *path,
+                                      esp_http_client_method_t method,
+                                      const char *content_type,
+                                      const char *bearer_token,
+                                      const uint8_t *body,
+                                      size_t body_len,
+                                      char *response_buf,
+                                      size_t response_buf_size,
+                                      int *status_out)
+{
+    char bearer_header[RUNTIME_WHISPER_API_KEY_MAX + 16U];
+    const char *authorization_header = NULL;
+
+    if (bearer_token != NULL && bearer_token[0] != '\0') {
+        if (snprintf(bearer_header, sizeof(bearer_header), "Bearer %s", bearer_token) >=
+            (int)sizeof(bearer_header)) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        authorization_header = bearer_header;
+    }
+
+    return perform_http_request_with_auth_header(cfg,
+                                                 path,
+                                                 method,
+                                                 content_type,
+                                                 authorization_header,
+                                                 body,
+                                                 body_len,
+                                                 response_buf,
+                                                 response_buf_size,
+                                                 status_out,
+                                                 true);
 }
 
 static void clear_query_result(query_result_t *result)
@@ -2119,6 +2374,284 @@ cleanup:
     return err;
 }
 
+static uint8_t *alloc_large_buffer(size_t size)
+{
+    uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        buf = malloc(size);
+    }
+    return buf;
+}
+
+static esp_err_t build_volc_tts_request_body(const runtime_config_t *cfg,
+                                             const char *text,
+                                             char **body_out)
+{
+    cJSON *root = NULL;
+    cJSON *app = NULL;
+    cJSON *user = NULL;
+    cJSON *audio = NULL;
+    cJSON *request = NULL;
+    char reqid[48];
+    char *printed = NULL;
+    esp_err_t err = ESP_OK;
+
+    if (cfg == NULL || text == NULL || text[0] == '\0' || body_out == NULL ||
+        cfg->volc_tts_appid[0] == '\0' || cfg->volc_tts_api_key[0] == '\0' ||
+        cfg->volc_tts_voice_type[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    snprintf(reqid,
+             sizeof(reqid),
+             "%08" PRIx32 "%08" PRIx32,
+             esp_random(),
+             esp_random());
+
+    root = cJSON_CreateObject();
+    app = cJSON_CreateObject();
+    user = cJSON_CreateObject();
+    audio = cJSON_CreateObject();
+    request = cJSON_CreateObject();
+    if (root == NULL || app == NULL || user == NULL || audio == NULL || request == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    if (cJSON_AddStringToObject(app, "appid", cfg->volc_tts_appid) == NULL ||
+        cJSON_AddStringToObject(app, "token", cfg->volc_tts_api_key) == NULL ||
+        cJSON_AddStringToObject(app, "cluster", cfg->volc_tts_cluster) == NULL ||
+        cJSON_AddStringToObject(user, "uid", cfg->device_id[0] ? cfg->device_id : "vibe-box") == NULL ||
+        cJSON_AddStringToObject(audio, "voice", "other") == NULL ||
+        cJSON_AddStringToObject(audio, "voice_type", cfg->volc_tts_voice_type) == NULL ||
+        cJSON_AddStringToObject(audio, "encoding", "wav") == NULL ||
+        cJSON_AddNumberToObject(audio, "rate", VIBE_BOX_I2S_SAMPLE_RATE_HZ) == NULL ||
+        cJSON_AddStringToObject(request, "reqid", reqid) == NULL ||
+        cJSON_AddStringToObject(request, "text", text) == NULL ||
+        cJSON_AddStringToObject(request, "operation", "query") == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    if (!cJSON_AddItemToObject(root, "app", app) ||
+        !cJSON_AddItemToObject(root, "user", user) ||
+        !cJSON_AddItemToObject(root, "audio", audio) ||
+        !cJSON_AddItemToObject(root, "request", request)) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+    app = NULL;
+    user = NULL;
+    audio = NULL;
+    request = NULL;
+
+    printed = cJSON_PrintUnformatted(root);
+    if (printed == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    *body_out = printed;
+    printed = NULL;
+
+cleanup:
+    if (printed != NULL) {
+        cJSON_free(printed);
+    }
+    cJSON_Delete(app);
+    cJSON_Delete(user);
+    cJSON_Delete(audio);
+    cJSON_Delete(request);
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t parse_volc_tts_response(const char *response_body,
+                                         uint8_t **wav_out,
+                                         size_t *wav_size_out)
+{
+    cJSON *root = NULL;
+    cJSON *code = NULL;
+    cJSON *data = NULL;
+    uint8_t *decoded = NULL;
+    size_t decoded_cap;
+    size_t decoded_len = 0;
+    int numeric_code = 0;
+    esp_err_t err = ESP_OK;
+
+    if (response_body == NULL || wav_out == NULL || wav_size_out == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *wav_out = NULL;
+    *wav_size_out = 0;
+
+    root = cJSON_Parse(response_body);
+    if (root == NULL) {
+        ESP_LOGE(TAG, "failed to parse TTS JSON");
+        return ESP_FAIL;
+    }
+
+    code = cJSON_GetObjectItemCaseSensitive(root, "code");
+    if (cJSON_IsNumber(code)) {
+        numeric_code = code->valueint;
+    } else if (cJSON_IsString(code) && code->valuestring != NULL) {
+        numeric_code = atoi(code->valuestring);
+    }
+    if (numeric_code != 3000) {
+        cJSON *message = cJSON_GetObjectItemCaseSensitive(root, "message");
+        ESP_LOGE(TAG,
+                 "TTS failed code=%d message=%s",
+                 numeric_code,
+                 cJSON_IsString(message) && message->valuestring != NULL ? message->valuestring : "<none>");
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    data = cJSON_GetObjectItemCaseSensitive(root, "data");
+    if (!cJSON_IsString(data) || data->valuestring == NULL || data->valuestring[0] == '\0') {
+        err = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
+
+    size_t encoded_len = strlen(data->valuestring);
+    decoded_cap = ((encoded_len / 4U) * 3U) + 4U;
+    decoded = alloc_large_buffer(decoded_cap);
+    if (decoded == NULL) {
+        err = ESP_ERR_NO_MEM;
+        goto cleanup;
+    }
+
+    int ret = mbedtls_base64_decode(decoded,
+                                    decoded_cap,
+                                    &decoded_len,
+                                    (const unsigned char *)data->valuestring,
+                                    encoded_len);
+    if (ret != 0 || decoded_len == 0U) {
+        ESP_LOGE(TAG, "TTS base64 decode failed ret=%d", ret);
+        err = ESP_FAIL;
+        goto cleanup;
+    }
+
+    *wav_out = decoded;
+    *wav_size_out = decoded_len;
+    decoded = NULL;
+
+cleanup:
+    free(decoded);
+    cJSON_Delete(root);
+    return err;
+}
+
+static audio_input_i2s_config_t make_audio_i2s_config(uint32_t duration_ms)
+{
+    return (audio_input_i2s_config_t){
+        .i2s_port = VIBE_BOX_I2S_PORT,
+        .i2c_port = VIBE_BOX_I2C_PORT,
+        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
+        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
+        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
+        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
+        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
+        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
+        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
+        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
+        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
+        .dout_gpio = VIBE_BOX_I2S_DOUT_GPIO,
+        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
+        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
+        .bits_per_sample = 16,
+        .duration_ms = duration_ms,
+        .playback_volume_percent = s_runtime_config.tts_volume_percent,
+        .playback_muted = s_runtime_config.tts_muted,
+    };
+}
+
+static esp_err_t synthesize_tts_and_play(const runtime_config_t *cfg, const char *text)
+{
+    char *request_body = NULL;
+    char *response_buf = NULL;
+    uint8_t *wav = NULL;
+    size_t wav_size = 0;
+    char auth_header[RUNTIME_VOLC_TTS_API_KEY_MAX + 16U];
+    int status = 0;
+    esp_err_t err;
+
+    if (cfg == NULL || text == NULL || text[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!cfg->tts_enabled) {
+        ESP_LOGI(TAG, "TTS skipped: disabled");
+        return ESP_OK;
+    }
+    if (cfg->volc_tts_appid[0] == '\0' || cfg->volc_tts_api_key[0] == '\0' ||
+        cfg->volc_tts_voice_type[0] == '\0') {
+        ESP_LOGW(TAG,
+                 "TTS skipped: incomplete config appid=%s api_key=%s voice_type=%s",
+                 cfg->volc_tts_appid[0] ? "set" : "empty",
+                 cfg->volc_tts_api_key[0] ? "set" : "empty",
+                 cfg->volc_tts_voice_type[0] ? "set" : "empty");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    response_buf = (char *)alloc_large_buffer(TTS_RESPONSE_BUFFER_SIZE);
+    if (response_buf == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    response_buf[0] = '\0';
+
+    err = build_volc_tts_request_body(cfg, text, &request_body);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+    if (snprintf(auth_header, sizeof(auth_header), "Bearer;%s", cfg->volc_tts_api_key) >=
+        (int)sizeof(auth_header)) {
+        err = ESP_ERR_INVALID_SIZE;
+        goto cleanup;
+    }
+    ESP_LOGI(TAG,
+             "TTS request auth configured api_key_len=%u appid=%s voice_type=%s cluster=%s",
+             (unsigned)strlen(cfg->volc_tts_api_key),
+             cfg->volc_tts_appid,
+             cfg->volc_tts_voice_type,
+             cfg->volc_tts_cluster);
+
+    err = perform_http_request_with_auth_header(cfg,
+                                                VIBE_BOX_VOLC_TTS_URL,
+                                                HTTP_METHOD_POST,
+                                                "application/json",
+                                                auth_header,
+                                                (const uint8_t *)request_body,
+                                                strlen(request_body),
+                                                response_buf,
+                                                TTS_RESPONSE_BUFFER_SIZE,
+                                                &status,
+                                                false);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TTS request failed status=%d err=%s", status, esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    err = parse_volc_tts_response(response_buf, &wav, &wav_size);
+    if (err != ESP_OK) {
+        goto cleanup;
+    }
+
+    audio_input_i2s_config_t play_cfg = make_audio_i2s_config(0);
+    render_ui_status(APP_STATE_PLAYING, "Playing", "speaker output");
+    err = audio_input_play_wav(&play_cfg, wav, wav_size);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "TTS playback failed: %s", esp_err_to_name(err));
+    }
+
+cleanup:
+    if (request_body != NULL) {
+        cJSON_free(request_body);
+    }
+    free(response_buf);
+    free(wav);
+    return err;
+}
+
 static void log_query_result(const query_result_t *result)
 {
     size_t i;
@@ -2322,6 +2855,13 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         "<label><input name='translation_enabled' type='checkbox' value='1' %s /> Enable Translation</label>"
         "<label>Refine Prompt</label><textarea name='refine_prompt' maxlength='511'>%s</textarea>"
         "<label><input name='refine_enabled' type='checkbox' value='1' %s /> Enable Refine</label>"
+        "<label>Volc TTS App ID</label><input name='volc_tts_appid' value='%s' maxlength='95' />"
+        "<label>Volc TTS API Key</label><input name='volc_tts_api_key' type='password' value='%s' maxlength='255' />"
+        "<label>Volc TTS Voice Type</label><input name='volc_tts_voice_type' value='%s' maxlength='95' />"
+        "<label>Volc TTS Cluster</label><input name='volc_tts_cluster' value='%s' maxlength='63' />"
+        "<label><input name='tts_enabled' type='checkbox' value='1' %s /> Enable TTS Playback</label>"
+        "<label>TTS Volume</label><input name='tts_volume_percent' type='number' min='0' max='100' value='%u' />"
+        "<label><input name='tts_muted' type='checkbox' value='1' %s /> Mute TTS Playback</label>"
         "<label>Device ID</label><input name='device_id' value='%s' maxlength='63' />"
         "<label>Firmware Version</label><input name='firmware_version' value='%s' maxlength='63' />"
         "<label>Language</label><input name='language' value='%s' maxlength='15' />"
@@ -2342,6 +2882,13 @@ static esp_err_t provisioning_root_get_handler(httpd_req_t *req)
         s_runtime_config.translation_enabled ? "checked" : "",
         s_runtime_config.refine_prompt,
         s_runtime_config.refine_enabled ? "checked" : "",
+        s_runtime_config.volc_tts_appid,
+        s_runtime_config.volc_tts_api_key,
+        s_runtime_config.volc_tts_voice_type,
+        s_runtime_config.volc_tts_cluster,
+        s_runtime_config.tts_enabled ? "checked" : "",
+        (unsigned)s_runtime_config.tts_volume_percent,
+        s_runtime_config.tts_muted ? "checked" : "",
         s_runtime_config.device_id,
         s_runtime_config.firmware_version,
         s_runtime_config.language,
@@ -2363,6 +2910,10 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              "\"openai_api_base\":\"%s\",\"openai_api_key_configured\":%s,"
              "\"translation_model\":\"%s\",\"translation_target_language\":\"%s\","
              "\"translation_enabled\":%s,\"refine_enabled\":%s,"
+             "\"tts_enabled\":%s,\"tts_volume_percent\":%u,\"tts_muted\":%s,"
+             "\"volc_tts_appid\":\"%s\","
+             "\"volc_tts_api_key_configured\":%s,\"volc_tts_voice_type\":\"%s\","
+             "\"volc_tts_cluster\":\"%s\","
              "\"device_id\":\"%s\",\"firmware_version\":\"%s\","
              "\"language\":\"%s\",\"recording_duration_ms\":%" PRIu32 "}",
              app_state_name(APP_STATE_PROVISIONING),
@@ -2376,6 +2927,13 @@ static esp_err_t provisioning_status_get_handler(httpd_req_t *req)
              s_runtime_config.translation_target_language,
              s_runtime_config.translation_enabled ? "true" : "false",
              s_runtime_config.refine_enabled ? "true" : "false",
+             s_runtime_config.tts_enabled ? "true" : "false",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted ? "true" : "false",
+             s_runtime_config.volc_tts_appid,
+             s_runtime_config.volc_tts_api_key[0] ? "true" : "false",
+             s_runtime_config.volc_tts_voice_type,
+             s_runtime_config.volc_tts_cluster,
              s_runtime_config.device_id,
              s_runtime_config.firmware_version,
              s_runtime_config.language,
@@ -2452,6 +3010,34 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
                        next_config.refine_prompt,
                        sizeof(next_config.refine_prompt));
     next_config.refine_enabled = strstr(body, "refine_enabled=1") != NULL;
+    extract_form_value(body,
+                       "volc_tts_appid",
+                       next_config.volc_tts_appid,
+                       sizeof(next_config.volc_tts_appid));
+    extract_form_value(body,
+                       "volc_tts_api_key",
+                       next_config.volc_tts_api_key,
+                       sizeof(next_config.volc_tts_api_key));
+    extract_form_value(body,
+                       "volc_tts_voice_type",
+                       next_config.volc_tts_voice_type,
+                       sizeof(next_config.volc_tts_voice_type));
+    extract_form_value(body,
+                       "volc_tts_cluster",
+                       next_config.volc_tts_cluster,
+                       sizeof(next_config.volc_tts_cluster));
+    next_config.tts_enabled = strstr(body, "tts_enabled=1") != NULL;
+    {
+        char volume_buf[8];
+        if (extract_form_value(body, "tts_volume_percent", volume_buf, sizeof(volume_buf))) {
+            char *end = NULL;
+            unsigned long volume = strtoul(volume_buf, &end, 10);
+            if (end != NULL && *end == '\0' && volume <= 100UL) {
+                next_config.tts_volume_percent = (uint8_t)volume;
+            }
+        }
+    }
+    next_config.tts_muted = strstr(body, "tts_muted=1") != NULL;
     extract_form_value(body, "device_id", next_config.device_id, sizeof(next_config.device_id));
     extract_form_value(body,
                        "firmware_version",
@@ -2499,8 +3085,16 @@ static esp_err_t provisioning_configure_post_handler(httpd_req_t *req)
                 VIBE_BOX_DEFAULT_REFINE_PROMPT,
                 sizeof(next_config.refine_prompt));
     }
+    if (next_config.volc_tts_cluster[0] == '\0') {
+        strlcpy(next_config.volc_tts_cluster,
+                VIBE_BOX_DEFAULT_VOLC_TTS_CLUSTER,
+                sizeof(next_config.volc_tts_cluster));
+    }
     if (next_config.recording_duration_ms == 0U) {
         next_config.recording_duration_ms = VIBE_BOX_DEFAULT_RECORDING_DURATION_MS;
+    }
+    if (next_config.tts_volume_percent > 100U) {
+        next_config.tts_volume_percent = VIBE_BOX_TTS_VOLUME_DEFAULT;
     }
 
     ESP_RETURN_ON_ERROR(storage_save_runtime_config(&next_config), TAG, "failed to save config");
@@ -2612,23 +3206,7 @@ static esp_err_t connect_using_runtime_config(app_state_t *state, const char *re
 
 static esp_err_t prepare_audio_capture_pipeline(const runtime_config_t *cfg)
 {
-    audio_input_i2s_config_t capture_cfg = {
-        .i2s_port = VIBE_BOX_I2S_PORT,
-        .i2c_port = VIBE_BOX_I2C_PORT,
-        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
-        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
-        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
-        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
-        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
-        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
-        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
-        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
-        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
-        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
-        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
-        .bits_per_sample = 16,
-        .duration_ms = cfg->recording_duration_ms,
-    };
+    audio_input_i2s_config_t capture_cfg = make_audio_i2s_config(cfg->recording_duration_ms);
 
     return audio_input_prepare_i2s_capture(&capture_cfg);
 }
@@ -2638,13 +3216,25 @@ static void ui_dashboard_render_config_mode(void)
     char line[UI_EPAPER_MAX_COLS + 1];
     const int x = 4;
     const int line_step = 10;
+    const int volume_button_y = (int)TOUCH_CONFIG_VOLUME_BUTTON_TOP_Y;
+    const int volume_button_bottom = (int)TOUCH_CONFIG_VOLUME_BUTTON_BOTTOM_Y;
     const int button_y = (int)TOUCH_CONFIG_BUTTON_TOP_Y;
     const int button_bottom = UI_EPAPER_HEIGHT - 6;
     const int button_gap = 4;
-    const int left_x0 = 4;
-    const int left_x1 = (UI_EPAPER_WIDTH / 2) - button_gap;
-    const int right_x0 = (UI_EPAPER_WIDTH / 2) + button_gap;
-    const int right_x1 = UI_EPAPER_WIDTH - 5;
+    const int first_x = (int)TOUCH_CONFIG_BUTTON_FIRST_X;
+    const int second_x = (int)TOUCH_CONFIG_BUTTON_SECOND_X;
+    const int tr_x0 = 4;
+    const int tr_x1 = first_x - button_gap;
+    const int rf_x0 = first_x + button_gap;
+    const int rf_x1 = second_x - button_gap;
+    const int tts_x0 = second_x + button_gap;
+    const int tts_x1 = UI_EPAPER_WIDTH - 5;
+    const int vol_down_x0 = 4;
+    const int vol_down_x1 = first_x - button_gap;
+    const int vol_mute_x0 = first_x + button_gap;
+    const int vol_mute_x1 = second_x - button_gap;
+    const int vol_up_x0 = second_x + button_gap;
+    const int vol_up_x1 = UI_EPAPER_WIDTH - 5;
 
     ui_epaper_clear();
     ui_epaper_draw_text(x, 4, "Config Mode");
@@ -2657,17 +3247,38 @@ static void ui_dashboard_render_config_mode(void)
     ui_epaper_draw_text(x, 24, line);
     snprintf(line, sizeof(line), "Refine: %s", s_runtime_config.refine_enabled ? "ON" : "OFF");
     ui_epaper_draw_text(x, 24 + line_step, line);
+    snprintf(line, sizeof(line), "TTS: %s", s_runtime_config.tts_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(x, 24 + (line_step * 2), line);
+    snprintf(line,
+             sizeof(line),
+             "Vol: %u%% %s",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted ? "MUTED" : "ON");
+    ui_epaper_draw_text(x, 24 + (line_step * 3), line);
 
-    ui_epaper_draw_text(x, 54, "Swipe exits");
-    ui_epaper_draw_text(x, 64, "Tap a bottom button");
+    ui_epaper_draw_text(x, 70, "Swipe exits");
+    ui_epaper_draw_text(x, 80, "Tap a button");
 
-    ui_epaper_draw_rect(left_x0, button_y, left_x1, button_bottom);
-    ui_epaper_draw_rect(right_x0, button_y, right_x1, button_bottom);
+    ui_epaper_draw_rect(vol_down_x0, volume_button_y, vol_down_x1, volume_button_bottom);
+    ui_epaper_draw_rect(vol_mute_x0, volume_button_y, vol_mute_x1, volume_button_bottom);
+    ui_epaper_draw_rect(vol_up_x0, volume_button_y, vol_up_x1, volume_button_bottom);
+
+    ui_epaper_draw_rect(tr_x0, button_y, tr_x1, button_bottom);
+    ui_epaper_draw_rect(rf_x0, button_y, rf_x1, button_bottom);
+    ui_epaper_draw_rect(tts_x0, button_y, tts_x1, button_bottom);
+
+    ui_epaper_draw_text(vol_down_x0 + 10, volume_button_y + 10, "VOL-");
+    ui_epaper_draw_text(vol_mute_x0 + 6,
+                        volume_button_y + 10,
+                        s_runtime_config.tts_muted ? "UNM" : "MUTE");
+    ui_epaper_draw_text(vol_up_x0 + 10, volume_button_y + 10, "VOL+");
 
     snprintf(line, sizeof(line), "TR %s", s_runtime_config.translation_enabled ? "ON" : "OFF");
-    ui_epaper_draw_text(left_x0 + 8, button_y + 14, line);
+    ui_epaper_draw_text(tr_x0 + 4, button_y + 14, line);
     snprintf(line, sizeof(line), "RF %s", s_runtime_config.refine_enabled ? "ON" : "OFF");
-    ui_epaper_draw_text(right_x0 + 8, button_y + 14, line);
+    ui_epaper_draw_text(rf_x0 + 4, button_y + 14, line);
+    snprintf(line, sizeof(line), "TT %s", s_runtime_config.tts_enabled ? "ON" : "OFF");
+    ui_epaper_draw_text(tts_x0 + 4, button_y + 14, line);
 }
 
 static void ui_dashboard_render_once(void)
@@ -2804,6 +3415,18 @@ static void ui_dashboard_render_once(void)
     y += line_step;
 
     snprintf(line, sizeof(line), "Refine: %s", s_runtime_config.refine_enabled ? "on" : "off");
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    snprintf(line, sizeof(line), "TTS: %s", s_runtime_config.tts_enabled ? "on" : "off");
+    ui_epaper_draw_text(x, y, line);
+    y += line_step;
+
+    snprintf(line,
+             sizeof(line),
+             "Volume: %u%% %s",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted ? "muted" : "on");
     ui_epaper_draw_text(x, y, line);
     y += line_step;
 
@@ -2994,23 +3617,7 @@ static bool handle_press_and_hold_recording(record_owner_t owner)
         return false;
     }
 
-    audio_input_i2s_config_t capture_cfg = {
-        .i2s_port = VIBE_BOX_I2S_PORT,
-        .i2c_port = VIBE_BOX_I2C_PORT,
-        .i2c_sda_gpio = VIBE_BOX_I2C_SDA_GPIO,
-        .i2c_scl_gpio = VIBE_BOX_I2C_SCL_GPIO,
-        .codec_i2c_addr = VIBE_BOX_CODEC_I2C_ADDR,
-        .pa_enable_gpio = VIBE_BOX_AUDIO_PA_ENABLE_GPIO,
-        .pa_control_gpio = VIBE_BOX_AUDIO_PA_CONTROL_GPIO,
-        .mclk_gpio = VIBE_BOX_I2S_MCLK_GPIO,
-        .bclk_gpio = VIBE_BOX_I2S_BCLK_GPIO,
-        .ws_gpio = VIBE_BOX_I2S_WS_GPIO,
-        .din_gpio = VIBE_BOX_I2S_DIN_GPIO,
-        .sample_rate_hz = VIBE_BOX_I2S_SAMPLE_RATE_HZ,
-        .channels = (uint16_t)VIBE_BOX_I2S_CHANNELS,
-        .bits_per_sample = 16,
-        .duration_ms = 0,
-    };
+    audio_input_i2s_config_t capture_cfg = make_audio_i2s_config(0);
 
     esp_err_t err = audio_input_recording_start(&capture_cfg, VIBE_BOX_RECORDING_MAX_MS);
     if (err != ESP_OK) {
@@ -3123,6 +3730,13 @@ static void handle_press_release_and_upload(record_owner_t owner)
         } else {
             ESP_LOGW(TAG, "BLE text input notify failed: %s", esp_err_to_name(ble_err));
         }
+        if (s_runtime_config.tts_enabled) {
+            render_ui_status(APP_STATE_TTS, "TTS", "synthesizing");
+            esp_err_t tts_err = synthesize_tts_and_play(&s_runtime_config, text_to_input);
+            if (tts_err != ESP_OK) {
+                ESP_LOGW(TAG, "TTS skipped/failed: %s", esp_err_to_name(tts_err));
+            }
+        }
         render_ui_query_result(&s_last_query_result);
         render_ui_status(APP_STATE_IDLE, "Idle", "ready for next take");
     } else {
@@ -3233,6 +3847,87 @@ static void toggle_refine_enabled(const char *reason)
     }
 }
 
+static void toggle_tts_enabled(const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    next_config.tts_enabled = !s_runtime_config.tts_enabled;
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS toggle failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "TTS %s via %s",
+             s_runtime_config.tts_enabled ? "enabled" : "disabled",
+             reason != NULL ? reason : "toggle");
+    if (s_touch_config_mode) {
+        notify_ui_dashboard();
+    } else {
+        render_ui_status(APP_STATE_IDLE,
+                         "TTS",
+                         s_runtime_config.tts_enabled ? "enabled" : "disabled");
+    }
+}
+
+static void set_tts_volume(uint8_t volume_percent, const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    if (volume_percent > 100U) {
+        volume_percent = 100U;
+    }
+    next_config.tts_volume_percent = volume_percent;
+    if (volume_percent > 0U) {
+        next_config.tts_muted = false;
+    }
+
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS volume failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "TTS volume=%u%% muted=%d via %s",
+             (unsigned)s_runtime_config.tts_volume_percent,
+             s_runtime_config.tts_muted,
+             reason != NULL ? reason : "volume");
+    notify_ui_dashboard();
+}
+
+static void adjust_tts_volume(int delta_percent, const char *reason)
+{
+    int next = (int)s_runtime_config.tts_volume_percent + delta_percent;
+
+    if (next < 0) {
+        next = 0;
+    } else if (next > 100) {
+        next = 100;
+    }
+
+    set_tts_volume((uint8_t)next, reason);
+}
+
+static void toggle_tts_muted(const char *reason)
+{
+    runtime_config_t next_config = s_runtime_config;
+
+    next_config.tts_muted = !s_runtime_config.tts_muted;
+    esp_err_t err = storage_save_runtime_config(&next_config);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save TTS mute failed: %s", esp_err_to_name(err));
+    }
+
+    s_runtime_config = next_config;
+    ESP_LOGI(TAG,
+             "TTS %s via %s",
+             s_runtime_config.tts_muted ? "muted" : "unmuted",
+             reason != NULL ? reason : "mute");
+    notify_ui_dashboard();
+}
+
 static void set_touch_config_mode(bool enabled, const char *reason)
 {
     if (s_touch_config_mode == enabled) {
@@ -3264,14 +3959,27 @@ static bool handle_touch_config_tap(uint32_t held_ms)
     }
 
     ESP_LOGI(TAG, "touch config tap x=%u y=%u", (unsigned)x, (unsigned)y);
+    if (y >= TOUCH_CONFIG_VOLUME_BUTTON_TOP_Y && y <= TOUCH_CONFIG_VOLUME_BUTTON_BOTTOM_Y) {
+        if (x < TOUCH_CONFIG_BUTTON_FIRST_X) {
+            adjust_tts_volume(-(int)VIBE_BOX_TTS_VOLUME_STEP, "config tap");
+        } else if (x < TOUCH_CONFIG_BUTTON_SECOND_X) {
+            toggle_tts_muted("config tap");
+        } else {
+            adjust_tts_volume((int)VIBE_BOX_TTS_VOLUME_STEP, "config tap");
+        }
+        return true;
+    }
+
     if (y < TOUCH_CONFIG_BUTTON_TOP_Y) {
         return false;
     }
 
-    if (x < TOUCH_CONFIG_BUTTON_SPLIT_X) {
+    if (x < TOUCH_CONFIG_BUTTON_FIRST_X) {
         toggle_translation_enabled("config tap");
-    } else {
+    } else if (x < TOUCH_CONFIG_BUTTON_SECOND_X) {
         toggle_refine_enabled("config tap");
+    } else {
+        toggle_tts_enabled("config tap");
     }
     return true;
 }
@@ -3354,6 +4062,14 @@ static void on_touch_event(touch_event_t event, void *user_ctx)
         s_touch_recording_started = false;
         if (s_touch_config_mode) {
             return;
+        }
+        if (s_touch_last_tap_release_ms != 0U &&
+            now_ms - s_touch_last_tap_release_ms <= (uint32_t)VIBE_BOX_TOUCH_DOUBLE_TAP_MS) {
+            ESP_LOGI(TAG, "touch down is double-tap candidate; hold recording deferred");
+            return;
+        }
+        if (s_touch_last_tap_release_ms != 0U) {
+            s_touch_last_tap_release_ms = 0;
         }
         BaseType_t ok = xTaskCreatePinnedToCore(
             touch_hold_recording_task,

@@ -125,6 +125,13 @@ class DeviceConfig:
     translation_enabled: bool = False
     refine_prompt: str = DEFAULT_REFINE_PROMPT
     refine_enabled: bool = False
+    volc_tts_appid: str = ""
+    volc_tts_api_key: str = ""
+    volc_tts_voice_type: str = ""
+    volc_tts_cluster: str = "volcano_tts"
+    tts_enabled: bool = False
+    tts_volume_percent: int = 100
+    tts_muted: bool = False
     device_id: str = "vibe-box-dev"
     firmware_version: str = "dev"
     language: str = "zh"
@@ -145,6 +152,13 @@ class DeviceConfig:
             "translation_enabled": self.translation_enabled,
             "refine_prompt": self.refine_prompt,
             "refine_enabled": self.refine_enabled,
+            "volc_tts_appid": self.volc_tts_appid,
+            "volc_tts_api_key": self.volc_tts_api_key,
+            "volc_tts_voice_type": self.volc_tts_voice_type,
+            "volc_tts_cluster": self.volc_tts_cluster,
+            "tts_enabled": self.tts_enabled,
+            "tts_volume_percent": self.tts_volume_percent,
+            "tts_muted": self.tts_muted,
             "device_id": self.device_id,
             "firmware_version": self.firmware_version,
             "language": self.language,
@@ -168,6 +182,13 @@ def device_config_from_json(payload: str) -> DeviceConfig:
         translation_enabled=bool(values.get("translation_enabled", False)),
         refine_prompt=values.get("refine_prompt", DEFAULT_REFINE_PROMPT),
         refine_enabled=bool(values.get("refine_enabled", False)),
+        volc_tts_appid=values.get("volc_tts_appid", ""),
+        volc_tts_api_key=values.get("volc_tts_api_key", ""),
+        volc_tts_voice_type=values.get("volc_tts_voice_type", ""),
+        volc_tts_cluster=values.get("volc_tts_cluster", "volcano_tts"),
+        tts_enabled=bool(values.get("tts_enabled", False)),
+        tts_volume_percent=int(values.get("tts_volume_percent", 100)),
+        tts_muted=bool(values.get("tts_muted", False)),
         device_id=values.get("device_id", "vibe-box-dev"),
         firmware_version=values.get("firmware_version", "dev"),
         language=values.get("language", "zh"),
@@ -180,6 +201,8 @@ def validate_device_config(cfg: DeviceConfig) -> None:
         raise ValueError("wifi_ssid and whisper_api_url are required")
     if cfg.recording_duration_ms < 1000 or cfg.recording_duration_ms > 15000:
         raise ValueError("recording_duration_ms must be between 1000 and 15000")
+    if cfg.tts_volume_percent < 0 or cfg.tts_volume_percent > 100:
+        raise ValueError("tts_volume_percent must be between 0 and 100")
 
 
 class TextAssembler:
@@ -278,6 +301,13 @@ DEVICE_FIELDS = [
     ("translation_enabled", "Translation enabled", False),
     ("refine_prompt", "Refine prompt", False),
     ("refine_enabled", "Refine enabled", False),
+    ("volc_tts_appid", "Volc TTS appid", False),
+    ("volc_tts_api_key", "Volc TTS API key", True),
+    ("volc_tts_voice_type", "Volc TTS voice", False),
+    ("volc_tts_cluster", "Volc TTS cluster", False),
+    ("tts_enabled", "TTS enabled", False),
+    ("tts_volume_percent", "TTS volume", False),
+    ("tts_muted", "TTS muted", False),
     ("device_id", "Device ID", False),
     ("firmware_version", "Firmware version", False),
     ("language", "Language", False),
@@ -467,6 +497,11 @@ def edit_device_field(stdscr, state: TuiState) -> None:
             parsed = int(next_value)
             if parsed < 1000 or parsed > 15000:
                 raise ValueError("must be between 1000 and 15000")
+            setattr(state.device_config, key, parsed)
+        elif key == "tts_volume_percent":
+            parsed = int(next_value)
+            if parsed < 0 or parsed > 100:
+                raise ValueError("must be between 0 and 100")
             setattr(state.device_config, key, parsed)
         else:
             setattr(state.device_config, key, next_value.strip())

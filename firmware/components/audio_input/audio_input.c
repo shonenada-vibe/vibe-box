@@ -1,6 +1,9 @@
 #include "audio_input.h"
 
+#include <inttypes.h>
+#include <limits.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -39,6 +42,8 @@ static const char *TAG = "audio_input";
 #define ES8311_ADC_REG1A               0x1A
 #define ES8311_ADC_REG1B               0x1B
 #define ES8311_ADC_REG1C               0x1C
+#define ES8311_DAC_REG31               0x31
+#define ES8311_DAC_REG32               0x32
 #define ES8311_DAC_REG37               0x37
 #define ES8311_GPIO_REG44              0x44
 #define ES8311_GP_REG45                0x45
@@ -194,13 +199,46 @@ static esp_err_t es8311_start_adc(void)
     return ESP_OK;
 }
 
+static uint8_t es8311_dac_volume_reg(uint8_t volume_percent)
+{
+    if (volume_percent > 100U) {
+        volume_percent = 100U;
+    }
+
+    return (uint8_t)(((uint16_t)volume_percent * 0xBFU + 50U) / 100U);
+}
+
+static esp_err_t es8311_start_dac(uint8_t volume_percent, bool muted)
+{
+    /* Keep the codec setup aligned with the ADC path, but unmute the DAC
+     * serial input (REG09 bit 6) and power up the DAC analog/digital blocks. */
+    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_SDPIN_REG09, 0x40, 0x00), TAG, "unmute dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0D, 0x01), TAG, "reg0d digital pwr failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG0E, 0x02), TAG, "reg0e analog pwr failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG12, 0x00), TAG, "reg12 pwr-up failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG14, 0x1A), TAG, "reg14 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_SYSTEM_REG15, 0x40), TAG, "reg15 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG37, 0x08), TAG, "reg37 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_GP_REG45, 0x00), TAG, "reg45 dac failed");
+    ESP_RETURN_ON_ERROR(es8311_write_reg(ES8311_DAC_REG32,
+                                         es8311_dac_volume_reg(volume_percent)),
+                        TAG,
+                        "dac volume failed");
+    ESP_RETURN_ON_ERROR(es8311_update_reg(ES8311_DAC_REG31,
+                                          0x60,
+                                          muted ? 0x60 : 0x00),
+                        TAG,
+                        "dac mute failed");
+    return ESP_OK;
+}
+
 static void es8311_dump_registers(const char *label)
 {
     static const uint8_t regs[] = {
         0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
         0x09, 0x0A, 0x0D, 0x0E, 0x12, 0x13, 0x14, 0x15,
         0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C,
-        0x44, 0x45, 0xFD, 0xFE, 0xFF,
+        0x31, 0x32, 0x37, 0x44, 0x45, 0xFD, 0xFE, 0xFF,
     };
     for (size_t i = 0; i < sizeof(regs); ++i) {
         uint8_t v = 0xAA;
@@ -225,6 +263,17 @@ static void write_le32(uint8_t *dst, uint32_t value)
     dst[1] = (uint8_t)((value >> 8U) & 0xffU);
     dst[2] = (uint8_t)((value >> 16U) & 0xffU);
     dst[3] = (uint8_t)((value >> 24U) & 0xffU);
+}
+
+static uint16_t read_le16(const uint8_t *src)
+{
+    return (uint16_t)src[0] | ((uint16_t)src[1] << 8U);
+}
+
+static uint32_t read_le32(const uint8_t *src)
+{
+    return (uint32_t)src[0] | ((uint32_t)src[1] << 8U) |
+           ((uint32_t)src[2] << 16U) | ((uint32_t)src[3] << 24U);
 }
 
 static esp_err_t write_wav_header(uint8_t *dst,
@@ -272,6 +321,96 @@ static i2s_std_slot_config_t build_i2s_rx_slot_config(const audio_input_i2s_conf
     }
 
     return slot_cfg;
+}
+
+static i2s_std_slot_config_t build_i2s_tx_slot_config(uint16_t channels)
+{
+    i2s_std_slot_config_t slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
+        I2S_DATA_BIT_WIDTH_16BIT,
+        channels == 1U ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO);
+
+    slot_cfg.slot_mask = channels == 1U ? I2S_STD_SLOT_LEFT : I2S_STD_SLOT_BOTH;
+    return slot_cfg;
+}
+
+static size_t duplicate_mono_pcm16_to_stereo(const uint8_t *src,
+                                             size_t src_bytes,
+                                             uint8_t *dst,
+                                             size_t dst_size)
+{
+    size_t samples = src_bytes / 2U;
+
+    if (dst_size / 4U < samples) {
+        samples = dst_size / 4U;
+    }
+
+    for (size_t i = 0; i < samples; ++i) {
+        uint16_t sample = read_le16(src + (i * 2U));
+        write_le16(dst + (i * 4U), sample);
+        write_le16(dst + (i * 4U) + 2U, sample);
+    }
+
+    return samples * 4U;
+}
+
+typedef struct {
+    const uint8_t *pcm;
+    size_t pcm_size;
+    uint32_t sample_rate_hz;
+    uint16_t channels;
+    uint16_t bits_per_sample;
+} wav_view_t;
+
+static esp_err_t parse_pcm_wav(const uint8_t *wav, size_t wav_size, wav_view_t *out)
+{
+    size_t offset = 12U;
+    bool have_fmt = false;
+    bool have_data = false;
+    wav_view_t parsed = {0};
+
+    if (wav == NULL || out == NULL || wav_size < 44U ||
+        memcmp(wav, "RIFF", 4) != 0 || memcmp(wav + 8U, "WAVE", 4) != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    while (offset + 8U <= wav_size) {
+        const uint8_t *chunk = wav + offset;
+        uint32_t chunk_size = read_le32(chunk + 4U);
+        size_t chunk_data = offset + 8U;
+
+        if (chunk_data > wav_size || chunk_size > wav_size - chunk_data) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+
+        if (memcmp(chunk, "fmt ", 4) == 0) {
+            if (chunk_size < 16U) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            uint16_t audio_format = read_le16(wav + chunk_data);
+            parsed.channels = read_le16(wav + chunk_data + 2U);
+            parsed.sample_rate_hz = read_le32(wav + chunk_data + 4U);
+            parsed.bits_per_sample = read_le16(wav + chunk_data + 14U);
+            if (audio_format != 1U || parsed.sample_rate_hz == 0U ||
+                (parsed.channels != 1U && parsed.channels != 2U) ||
+                parsed.bits_per_sample != 16U) {
+                return ESP_ERR_NOT_SUPPORTED;
+            }
+            have_fmt = true;
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            parsed.pcm = wav + chunk_data;
+            parsed.pcm_size = chunk_size;
+            have_data = chunk_size > 0U;
+        }
+
+        offset = chunk_data + chunk_size + (chunk_size & 1U);
+    }
+
+    if (!have_fmt || !have_data) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out = parsed;
+    return ESP_OK;
 }
 
 size_t audio_input_pcm_size(uint32_t sample_rate_hz,
@@ -409,6 +548,7 @@ typedef struct {
 
 static audio_recording_ctx_t *s_rec_ctx;
 static bool s_rec_stop_in_progress;
+static bool s_playback_active;
 static portMUX_TYPE s_rec_lock = portMUX_INITIALIZER_UNLOCKED;
 
 static void audio_recording_task(void *arg)
@@ -459,10 +599,10 @@ esp_err_t audio_input_recording_start(const audio_input_i2s_config_t *cfg,
         return ESP_ERR_INVALID_ARG;
     }
     portENTER_CRITICAL(&s_rec_lock);
-    bool already_recording = s_rec_ctx != NULL || s_rec_stop_in_progress;
+    bool already_recording = s_rec_ctx != NULL || s_rec_stop_in_progress || s_playback_active;
     portEXIT_CRITICAL(&s_rec_lock);
     if (already_recording) {
-        ESP_LOGW(TAG, "recording_start called while already recording");
+        ESP_LOGW(TAG, "recording_start called while audio pipeline is busy");
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -580,6 +720,14 @@ bool audio_input_recording_is_active(void)
     return active;
 }
 
+bool audio_input_playback_is_active(void)
+{
+    portENTER_CRITICAL(&s_rec_lock);
+    bool active = s_playback_active;
+    portEXIT_CRITICAL(&s_rec_lock);
+    return active;
+}
+
 esp_err_t audio_input_recording_stop(uint8_t **wav_out,
                                      size_t *wav_size_out,
                                      uint32_t *duration_ms_out)
@@ -676,4 +824,195 @@ esp_err_t audio_input_recording_stop(uint8_t **wav_out,
     free(ctx->pcm_buf);
     free(ctx);
     return result;
+}
+
+esp_err_t audio_input_play_wav(const audio_input_i2s_config_t *cfg,
+                               const uint8_t *wav,
+                               size_t wav_size)
+{
+    wav_view_t view = {0};
+    audio_input_i2s_config_t play_cfg;
+    i2s_chan_handle_t tx_handle = NULL;
+    uint8_t *stereo_chunk = NULL;
+    bool tx_enabled = false;
+    bool pa_enabled = false;
+    esp_err_t err;
+
+    if (cfg == NULL || wav == NULL || wav_size == 0U || cfg->dout_gpio < 0 ||
+        cfg->bclk_gpio < 0 || cfg->ws_gpio < 0 || cfg->bits_per_sample != 16U) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    err = parse_pcm_wav(wav, wav_size, &view);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "WAV parse failed: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (view.sample_rate_hz != cfg->sample_rate_hz) {
+        ESP_LOGW(TAG,
+                 "unsupported playback sample rate wav=%" PRIu32 " configured=%" PRIu32,
+                 view.sample_rate_hz,
+                 cfg->sample_rate_hz);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    portENTER_CRITICAL(&s_rec_lock);
+    bool busy = s_rec_ctx != NULL || s_rec_stop_in_progress || s_playback_active;
+    if (!busy) {
+        s_playback_active = true;
+    }
+    portEXIT_CRITICAL(&s_rec_lock);
+    if (busy) {
+        ESP_LOGW(TAG, "playback requested while audio pipeline is busy");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    play_cfg = *cfg;
+    play_cfg.channels = view.channels == 1U ? 2U : view.channels;
+    play_cfg.bits_per_sample = view.bits_per_sample;
+    play_cfg.duration_ms = 0;
+
+    err = audio_input_prepare_i2s_capture(&play_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "prepare codec for playback failed: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG((i2s_port_t)play_cfg.i2s_port,
+                                                            I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    err = i2s_new_channel(&chan_cfg, &tx_handle, NULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s tx channel create failed: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(play_cfg.sample_rate_hz),
+        .slot_cfg = build_i2s_tx_slot_config(play_cfg.channels),
+        .gpio_cfg = {
+            .mclk = play_cfg.mclk_gpio,
+            .bclk = play_cfg.bclk_gpio,
+            .ws = play_cfg.ws_gpio,
+            .dout = play_cfg.dout_gpio,
+            .din = I2S_GPIO_UNUSED,
+            .invert_flags = {0},
+        },
+    };
+    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+
+    err = i2s_channel_init_std_mode(tx_handle, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s tx init failed: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+
+    err = i2s_channel_enable(tx_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s tx enable failed: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+    tx_enabled = true;
+
+    vTaskDelay(pdMS_TO_TICKS(20));
+    err = es8311_start_dac(play_cfg.playback_volume_percent, play_cfg.playback_muted);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "es8311_start_dac failed: %s", esp_err_to_name(err));
+        goto cleanup;
+    }
+    if (play_cfg.pa_enable_gpio >= 0) {
+        err = configure_output_pin(play_cfg.pa_enable_gpio, 1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "pa_enable failed: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+        pa_enabled = true;
+    }
+    if (play_cfg.pa_control_gpio >= 0) {
+        err = configure_output_pin(play_cfg.pa_control_gpio, 1);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "pa_control failed: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+        pa_enabled = true;
+    }
+    if (pa_enabled) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    ESP_LOGI(TAG,
+             "playback started pcm_bytes=%u sample_rate=%" PRIu32
+             " wav_channels=%u i2s_channels=%u volume=%u%% muted=%d",
+             (unsigned)view.pcm_size,
+             view.sample_rate_hz,
+             (unsigned)view.channels,
+             (unsigned)play_cfg.channels,
+             (unsigned)play_cfg.playback_volume_percent,
+             play_cfg.playback_muted);
+
+    size_t offset = 0;
+    if (view.channels == 1U) {
+        stereo_chunk = malloc(4096U);
+        if (stereo_chunk == NULL) {
+            err = ESP_ERR_NO_MEM;
+            ESP_LOGE(TAG, "allocate stereo playback chunk failed");
+            goto cleanup;
+        }
+    }
+    while (offset < view.pcm_size) {
+        size_t to_write = view.pcm_size - offset;
+        if (to_write > 4096U) {
+            to_write = 4096U;
+        }
+        if (view.channels == 1U && to_write > 2048U) {
+            to_write = 2048U;
+        }
+        to_write &= ~(size_t)1U;
+        if (to_write == 0U) {
+            break;
+        }
+
+        const uint8_t *write_buf = view.pcm + offset;
+        size_t write_len = to_write;
+        if (view.channels == 1U) {
+            write_len = duplicate_mono_pcm16_to_stereo(write_buf, to_write, stereo_chunk, 4096U);
+            write_buf = stereo_chunk;
+        }
+
+        size_t written = 0;
+        err = i2s_channel_write(tx_handle,
+                                write_buf,
+                                write_len,
+                                &written,
+                                pdMS_TO_TICKS(1000));
+        if ((err != ESP_OK && err != ESP_ERR_TIMEOUT) || written == 0U) {
+            ESP_LOGE(TAG, "i2s tx write failed: %s", esp_err_to_name(err));
+            goto cleanup;
+        }
+        offset += view.channels == 1U ? (written / 2U) : written;
+    }
+
+    ESP_LOGI(TAG, "playback finished pcm_bytes=%u", (unsigned)view.pcm_size);
+    err = ESP_OK;
+
+cleanup:
+    if (pa_enabled) {
+        if (play_cfg.pa_control_gpio >= 0) {
+            (void)gpio_set_level(play_cfg.pa_control_gpio, 0);
+        }
+        if (play_cfg.pa_enable_gpio >= 0) {
+            (void)gpio_set_level(play_cfg.pa_enable_gpio, 0);
+        }
+    }
+    if (tx_handle != NULL) {
+        if (tx_enabled) {
+            (void)i2s_channel_disable(tx_handle);
+        }
+        (void)i2s_del_channel(tx_handle);
+    }
+    free(stereo_chunk);
+    portENTER_CRITICAL(&s_rec_lock);
+    s_playback_active = false;
+    portEXIT_CRITICAL(&s_rec_lock);
+    return err;
 }
